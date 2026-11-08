@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthenticatedUser } from '@/lib/security/vault-and-auth';
+import { errorResponse, getAuthenticatedUser } from '@/lib/security/vault-and-auth';
 import { getDb, writeAuditLog } from '@/lib/db';
 import { getFullWorkspaceState } from '@/lib/services/workspace-service';
 
@@ -19,6 +19,12 @@ export async function POST(req: NextRequest) {
     }
 
     const db = await getDb();
+    if (exportPurchaseId) {
+      const own = await db.query(`SELECT 1 FROM export_purchases WHERE id = $1 AND user_id = $2`, [exportPurchaseId, user.id]);
+      if (own.rows.length === 0) {
+        return NextResponse.json({ ok: false, error: 'Purchase not found' }, { status: 404 });
+      }
+    }
     const ratingId = `rat_${Date.now()}`;
     await db.query(
       `INSERT INTO ratings (id, user_id, export_purchase_id, stars, comment, created_at)
@@ -38,9 +44,6 @@ export async function POST(req: NextRequest) {
     const updatedState = await getFullWorkspaceState(user.id);
     return NextResponse.json({ ok: true, data: updatedState });
   } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Rating submission failed' },
-      { status: 400 }
-    );
+    return errorResponse(err, 400);
   }
 }

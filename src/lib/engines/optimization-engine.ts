@@ -10,6 +10,8 @@ import {
 import {
   computeHomeOfficeDeduction,
   computeVehicleDeduction,
+  estimateOpportunityEffect,
+  ScenarioInputs,
 } from '@/lib/engines/tax-calculator';
 
 const CATEGORY_LABELS: Record<ScheduleCCategory, { title: string; irsCitation: string }> = {
@@ -112,9 +114,8 @@ export function generateTaxOptimizationRecommendations(params: {
   const now = new Date().toISOString();
   const recommendations: TaxRecommendationRecord[] = [];
 
-  const marginalCombinedRate =
-    calculationRun.scenarios.confirmed.marginal_combined_rate_pct / 100;
-  const marginalIncomeAndStateRate = Math.max(0.12, marginalCombinedRate - 0.1413);
+  const inputs: ScenarioInputs = { profile, transactions, classifications, ruleVersion };
+  const fmt = (n: number) => `$${n.toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
 
   const clsByTxId = new Map<string, TransactionClassificationRecord>();
   for (const c of classifications) {
@@ -179,7 +180,12 @@ export function generateTaxOptimizationRecommendations(params: {
 
   for (const bucket of catBuckets.values()) {
     const meta = CATEGORY_LABELS[bucket.cat];
-    const realTaxSavings = round2(bucket.eligibleDeduction * marginalCombinedRate);
+    // Real effect = net federal tax with the bucket minus without it (same scenario).
+    const realTaxSavings = estimateOpportunityEffect(
+      inputs,
+      bucket.isConfirmed ? 'confirmed' : 'potential',
+      { transactionIds: bucket.txs.map((t) => t.id) }
+    );
     const docIds = Array.from(new Set(bucket.txs.map((t) => t.document_id)));
     const missingSet = new Set<string>();
     bucket.clsList.forEach((c) => c.missing_evidence_items.forEach((m) => missingSet.add(m)));
@@ -188,7 +194,7 @@ export function generateTaxOptimizationRecommendations(params: {
     const isSection179 = bucket.cat === 'depreciation_and_section_179';
 
     recommendations.push({
-      id: `rec_${profile.tax_year}_${bucket.cat}_${bucket.isConfirmed ? 'conf' : 'pot'}`,
+      id: `rec_${userId}_${profile.tax_year}_${bucket.cat}_${bucket.isConfirmed ? 'conf' : 'pot'}`,
       user_id: userId,
       tax_year: profile.tax_year,
       category: isSection179
@@ -206,7 +212,7 @@ export function generateTaxOptimizationRecommendations(params: {
       estimated_real_tax_savings: realTaxSavings,
       applied_rule_ref: `${ruleVersion.version_id} — ${meta.irsCitation}`,
       irs_citation: meta.irsCitation,
-      calculation_explanation: `$${bucket.grossAmount.toLocaleString()} gross expenditure -> $${bucket.eligibleDeduction.toLocaleString()} eligible Schedule C deduction × ${(marginalCombinedRate * 100).toFixed(1)}% combined marginal rate (Federal + SE + ${profile.state_code}) = $${realTaxSavings.toLocaleString()} real tax reduction.`,
+      calculation_explanation: `${fmt(bucket.grossAmount)} spent -> ${fmt(bucket.eligibleDeduction)} deductible on Schedule C (after business-use % and limits). Estimated federal tax impact, recalculated with and without these items (income tax + SE tax + credit interactions): ${fmt(realTaxSavings)}. A deduction is not a dollar-for-dollar saving. State tax not included.`,
       reasoning: bucket.clsList[0].reasoning,
       confidence_score: bucket.clsList[0].confidence_score,
       source_transaction_ids: bucket.txs.map((t) => t.id),
@@ -235,9 +241,11 @@ export function generateTaxOptimizationRecommendations(params: {
     });
 
     if (ho.deduction > 0) {
-      const realSavings = round2(ho.deduction * marginalCombinedRate);
+      const realSavings = estimateOpportunityEffect(inputs, 'potential', {
+        toggles: { homeOffice: false },
+      });
       recommendations.push({
-        id: `rec_${profile.tax_year}_home_office`,
+        id: `rec_${userId}_${profile.tax_year}_home_office`,
         user_id: userId,
         tax_year: profile.tax_year,
         category: 'home_office',
@@ -253,9 +261,9 @@ export function generateTaxOptimizationRecommendations(params: {
         estimated_real_tax_savings: realSavings,
         applied_rule_ref: `${ruleVersion.version_id} — IRC §280A(c)(1) & Form 8829`,
         irs_citation: 'IRC §280A(c)(1) / IRS Publication 587 / Form 8829',
-        calculation_explanation: `Compared Simplified ($${ho.simplifiedAmount.toLocaleString()} for ${profile.home_office_sqft} sq ft) vs. Regular Actual Method ($${ho.regularAmount.toLocaleString()} at ${((profile.home_office_sqft / profile.home_total_sqft) * 100).toFixed(1)}% business floor ratio). Selected optimal $${ho.deduction.toLocaleString()} deduction -> $${realSavings.toLocaleString()} real tax savings.`,
+        calculation_explanation: `Compared Simplified ($${ho.simplifiedAmount.toLocaleString()} for ${profile.home_office_sqft} sq ft) vs. Regular Actual Method ($${ho.regularAmount.toLocaleString()} at ${((profile.home_office_sqft / profile.home_total_sqft) * 100).toFixed(1)}% business floor ratio). Larger method selected: ${fmt(ho.deduction)} deduction -> estimated federal tax impact ${fmt(realSavings)}.`,
         reasoning:
-          'Taxpayer uses a dedicated home office area for administrative and client work. Optimal method selected automatically and capped at tentative Schedule C profit.',
+          'A home office is deductible only if the space is used regularly and exclusively as the principal place of business (IRC §280A). The deduction is capped at the business profit.',
         confidence_score: 0.94,
         source_transaction_ids: [],
         source_document_ids: [],
@@ -272,29 +280,36 @@ export function generateTaxOptimizationRecommendations(params: {
     const veh = computeVehicleDeduction({
       profile,
       standardMileageRateCents: rules.standard_mileage_rate_cents,
+      rateChange: rules.standard_mileage_rate_change,
     });
     if (veh.deduction > 0) {
-      const realSavings = round2(veh.deduction * marginalCombinedRate);
+      const realSavings = estimateOpportunityEffect(inputs, 'potential', {
+        toggles: { vehicle: false },
+      });
       recommendations.push({
-        id: `rec_${profile.tax_year}_vehicle_mileage`,
+        id: `rec_${userId}_${profile.tax_year}_vehicle_mileage`,
         user_id: userId,
         tax_year: profile.tax_year,
         category: 'vehicle_mileage',
         title: `Business Vehicle Deduction (${veh.methodUsed === 'standard_mileage' ? `${rules.standard_mileage_rate_cents}¢/mile Standard Rate` : 'Actual Expense Method'})`,
-        status: 'verified_by_document',
+        status: profile.vehicle_mileage_log_confirmed
+          ? 'verified_by_document'
+          : 'potentially_deductible_confirmation_required',
         deduction_or_credit_type: 'deduction',
         gross_amount: veh.deduction,
         eligible_deduction_or_credit_amount: veh.deduction,
         estimated_real_tax_savings: realSavings,
         applied_rule_ref: `${ruleVersion.version_id} — IRC §162(a) & §274(d) Mileage Rate`,
-        irs_citation: 'IRS Notice 2024-80 / Publication 463 / Schedule C Line 9',
-        calculation_explanation: `Compared Standard Mileage (${profile.vehicle_business_miles.toLocaleString()} business miles × $${(rules.standard_mileage_rate_cents / 100).toFixed(2)} = $${veh.standardMileageAmount.toLocaleString()}) vs. Actual Expenses ($${veh.actualExpenseAmount.toLocaleString()}). Optimal deduction of $${veh.deduction.toLocaleString()} yields $${realSavings.toLocaleString()} real tax savings.`,
+        irs_citation: `IRC §274(d) / Publication 463 / Schedule C line 9 (${ruleVersion.official_sources.map((s) => s.form_or_pub).join('; ')})`,
+        calculation_explanation: `Compared Standard Mileage (${profile.vehicle_business_miles.toLocaleString()} business miles × $${(rules.standard_mileage_rate_cents / 100).toFixed(2)} = $${veh.standardMileageAmount.toLocaleString()}) vs. Actual Expenses ($${veh.actualExpenseAmount.toLocaleString()}). Larger method: ${fmt(veh.deduction)} deduction -> estimated federal tax impact ${fmt(realSavings)}. Vehicle costs on the statement are not counted again.`,
         reasoning:
           'Business mileage logged for client meetings and business errands reduces both income tax and Schedule SE self-employment tax.',
         confidence_score: 0.93,
         source_transaction_ids: [],
         source_document_ids: [],
-        missing_confirmations: ['Maintain contemporaneous mileage log (dates, destinations, business purpose)'],
+        missing_confirmations: profile.vehicle_mileage_log_confirmed
+          ? []
+          : ['Confirm a contemporaneous mileage log (dates, destinations, business purpose) — required by IRC §274(d)'],
         created_at: now,
       });
     }
@@ -303,9 +318,9 @@ export function generateTaxOptimizationRecommendations(params: {
   // 4. Special Optimization: Qualified Business Income (QBI) 20% Deduction (IRC §199A)
   const qbiAmount = calculationRun.scenarios.confirmed.qbi_deduction;
   if (qbiAmount > 0) {
-    const qbiRealSavings = round2(qbiAmount * marginalIncomeAndStateRate);
+    const qbiRealSavings = round2(qbiAmount * federalMarginal(calculationRun));
     recommendations.push({
-      id: `rec_${profile.tax_year}_qbi_199a`,
+      id: `rec_${userId}_${profile.tax_year}_qbi_199a`,
       user_id: userId,
       tax_year: profile.tax_year,
       category: 'qbi_deduction',
@@ -317,7 +332,7 @@ export function generateTaxOptimizationRecommendations(params: {
       estimated_real_tax_savings: qbiRealSavings,
       applied_rule_ref: `${ruleVersion.version_id} — IRC §199A (Form 8995)`,
       irs_citation: 'IRC §199A / IRS Form 8995 Instructions',
-      calculation_explanation: `20% of net Qualified Business Income after SE tax, SE health insurance, and retirement adjustments = $${qbiAmount.toLocaleString()} deduction -> $${qbiRealSavings.toLocaleString()} federal income tax reduction.`,
+      calculation_explanation: `20% of net Qualified Business Income after SE tax, SE health insurance, and retirement adjustments = $${qbiAmount.toLocaleString()} deduction -> about ${fmt(qbiRealSavings)} less federal income tax at your marginal bracket. QBI does not reduce self-employment tax. Calculated as for a sole proprietor with no W-2 employees and no qualified property.`,
       reasoning:
         'Pass-through sole proprietorship net profit qualifies for the 20% §199A deduction subject to taxable income thresholds.',
       confidence_score: 0.99,
@@ -331,21 +346,23 @@ export function generateTaxOptimizationRecommendations(params: {
   // 5. Special Optimization: Self-Employed Health Insurance Deduction (IRC §162(l))
   const seHealthAmt = calculationRun.scenarios.confirmed.se_health_insurance_deduction;
   if (seHealthAmt > 0) {
-    const seHealthSavings = round2(seHealthAmt * marginalIncomeAndStateRate);
+    const seHealthSavings = estimateOpportunityEffect(inputs, 'confirmed', {
+      toggles: { seHealthInsurance: false },
+    });
     recommendations.push({
-      id: `rec_${profile.tax_year}_se_health`,
+      id: `rec_${userId}_${profile.tax_year}_se_health`,
       user_id: userId,
       tax_year: profile.tax_year,
       category: 'se_health_insurance',
       title: 'Self-Employed Health Insurance Above-the-Line Deduction (Form 7206)',
-      status: 'verified_by_document',
+      status: 'potentially_deductible_confirmation_required',
       deduction_or_credit_type: 'deduction',
       gross_amount: profile.self_employed_health_insurance_premiums,
       eligible_deduction_or_credit_amount: seHealthAmt,
       estimated_real_tax_savings: seHealthSavings,
       applied_rule_ref: `${ruleVersion.version_id} — IRC §162(l) / Schedule 1 Line 17`,
       irs_citation: 'IRC §162(l) / IRS Form 7206',
-      calculation_explanation: `$${seHealthAmt.toLocaleString()} above-the-line AGI adjustment × ${(marginalIncomeAndStateRate * 100).toFixed(1)}% marginal income tax rate = $${seHealthSavings.toLocaleString()} tax reduction.`,
+      calculation_explanation: `${fmt(seHealthAmt)} adjustment to income (capped at business profit after half of SE tax and retirement contributions) -> estimated federal tax impact ${fmt(seHealthSavings)}.`,
       reasoning:
         'Self-employed individuals with net Schedule C profit may deduct 100% of health, dental, and vision premiums above the line.',
       confidence_score: 0.96,
@@ -359,27 +376,29 @@ export function generateTaxOptimizationRecommendations(params: {
   // 6. Special Optimization: SEP-IRA / Solo 401(k) Retirement Contribution
   const retAmt = calculationRun.scenarios.confirmed.retirement_contribution_deduction;
   if (retAmt > 0) {
-    const retSavings = round2(retAmt * marginalIncomeAndStateRate);
+    const retSavings = estimateOpportunityEffect(inputs, 'confirmed', {
+      toggles: { retirement: false },
+    });
     recommendations.push({
-      id: `rec_${profile.tax_year}_sep_ira`,
+      id: `rec_${userId}_${profile.tax_year}_sep_ira`,
       user_id: userId,
       tax_year: profile.tax_year,
       category: 'retirement_contribution',
       title: 'Self-Employed SEP-IRA / Solo 401(k) Deduction (Schedule 1 Line 16)',
-      status: 'verified_by_document',
+      status: 'potentially_deductible_confirmation_required',
       deduction_or_credit_type: 'deduction',
       gross_amount: profile.sep_ira_solo_401k_contributions,
       eligible_deduction_or_credit_amount: retAmt,
       estimated_real_tax_savings: retSavings,
       applied_rule_ref: `${ruleVersion.version_id} — IRC §404(h) / Publication 560`,
       irs_citation: 'IRC §404(h) / IRS Publication 560 (Retirement Plans for Small Business)',
-      calculation_explanation: `$${retAmt.toLocaleString()} deductible contribution lowers Adjusted Gross Income directly, saving $${retSavings.toLocaleString()} in federal and state income tax.`,
+      calculation_explanation: `$${retAmt.toLocaleString()} deductible contribution lowers Adjusted Gross Income directly, estimated federal tax impact ${fmt(retSavings)} (capped at 20% of net SE earnings and ${fmt(rules.sep_ira_dollar_limit)}).`,
       reasoning:
         'Contributions up to 20% of net adjusted self-employment income can be funded up until the tax filing deadline (including extensions).',
       confidence_score: 0.96,
       source_transaction_ids: [],
       source_document_ids: [],
-      missing_confirmations: [],
+      missing_confirmations: ['Confirm the plan type and that the contribution was made by the filing deadline'],
       created_at: now,
     });
   }
@@ -388,25 +407,25 @@ export function generateTaxOptimizationRecommendations(params: {
   const ctcAmt = calculationRun.scenarios.confirmed.child_tax_credit;
   if (ctcAmt > 0) {
     recommendations.push({
-      id: `rec_${profile.tax_year}_credit_ctc`,
+      id: `rec_${userId}_${profile.tax_year}_credit_ctc`,
       user_id: userId,
       tax_year: profile.tax_year,
       category: 'tax_credit',
-      title: `Child Tax Credit (${profile.qualifying_children_under_17} Qualifying Child)`,
-      status: 'verified_by_document',
+      title: `Child Tax Credit (${profile.qualifying_children_under_17} qualifying child${profile.qualifying_children_under_17 === 1 ? '' : 'ren'})`,
+      status: 'potentially_deductible_confirmation_required',
       deduction_or_credit_type: 'credit',
       gross_amount: ctcAmt,
       eligible_deduction_or_credit_amount: ctcAmt,
       estimated_real_tax_savings: ctcAmt, // Credits reduce tax 1:1
       applied_rule_ref: `${ruleVersion.version_id} — IRC §24 / Schedule 8812`,
       irs_citation: 'IRC §24 / Form 1040 Schedule 8812',
-      calculation_explanation: `Direct $1-for-$1 tax credit of $${ctcAmt.toLocaleString()} (${profile.qualifying_children_under_17} child × $${rules.child_tax_credit_per_child.toLocaleString()}, subject to AGI phase-out above $${rules.child_tax_credit_phaseout_start[profile.filing_status].toLocaleString()}).`,
+      calculation_explanation: `${profile.qualifying_children_under_17} child × ${fmt(rules.child_tax_credit_per_child)} (+ ${fmt(rules.other_dependent_credit)} per other dependent), reduced by $50 per $1,000 of AGI over ${fmt(rules.child_tax_credit_phaseout_start[profile.filing_status])}. Non-refundable part limited to income tax; refundable part (ACTC) up to ${fmt(rules.child_tax_credit_refundable_cap)} per child = 15% of earned income over $2,500. Total ${fmt(ctcAmt)}.`,
       reasoning:
         'Tax credits reduce tax liability dollar-for-dollar rather than merely reducing taxable income.',
-      confidence_score: 0.98,
+      confidence_score: 0.9,
       source_transaction_ids: [],
       source_document_ids: [],
-      missing_confirmations: [],
+      missing_confirmations: ['Each child needs a valid SSN, must be under 17 at year end, and must have lived with you more than half the year'],
       created_at: now,
     });
   }
@@ -414,19 +433,19 @@ export function generateTaxOptimizationRecommendations(params: {
   const cdccAmt = calculationRun.scenarios.confirmed.child_and_dependent_care_credit;
   if (cdccAmt > 0) {
     recommendations.push({
-      id: `rec_${profile.tax_year}_credit_cdcc`,
+      id: `rec_${userId}_${profile.tax_year}_credit_cdcc`,
       user_id: userId,
       tax_year: profile.tax_year,
       category: 'tax_credit',
       title: 'Child and Dependent Care Credit (Form 2441)',
-      status: 'verified_by_document',
+      status: 'potentially_deductible_confirmation_required',
       deduction_or_credit_type: 'credit',
       gross_amount: profile.child_care_expenses_paid,
       eligible_deduction_or_credit_amount: cdccAmt,
       estimated_real_tax_savings: cdccAmt,
       applied_rule_ref: `${ruleVersion.version_id} — IRC §21 / Form 2441`,
       irs_citation: 'IRC §21 / IRS Form 2441',
-      calculation_explanation: `20% credit on up to $3,000 ($6,000 for 2+ dependents) of qualifying work-related care expenses ($${profile.child_care_expenses_paid.toLocaleString()} paid) = $${cdccAmt.toLocaleString()} direct tax reduction.`,
+      calculation_explanation: `Credit rate depends on AGI (${(rules.child_care_rate_schedule.max_rate * 100).toFixed(0)}% down to ${(rules.child_care_rate_schedule.final_floor_rate * 100).toFixed(0)}%) on up to ${fmt(rules.child_care_max_one_dependent)} (${fmt(rules.child_care_max_two_plus_dependents)} for 2+) of work-related care costs, limited by earned income and by income tax. ${fmt(profile.child_care_expenses_paid)} paid -> ${fmt(cdccAmt)}.`,
       reasoning:
         'Care expenses paid so the taxpayer could work or actively run a business qualify for Form 2441 credit.',
       confidence_score: 0.95,
@@ -440,12 +459,12 @@ export function generateTaxOptimizationRecommendations(params: {
   const eduAmt = calculationRun.scenarios.confirmed.education_credit;
   if (eduAmt > 0) {
     recommendations.push({
-      id: `rec_${profile.tax_year}_credit_education`,
+      id: `rec_${userId}_${profile.tax_year}_credit_education`,
       user_id: userId,
       tax_year: profile.tax_year,
       category: 'tax_credit',
       title: 'Higher Education Tax Credit (AOTC / Lifetime Learning Credit — Form 8863)',
-      status: 'verified_by_document',
+      status: 'potentially_deductible_confirmation_required',
       deduction_or_credit_type: 'credit',
       gross_amount: profile.education_expenses_paid,
       eligible_deduction_or_credit_amount: eduAmt,
@@ -465,24 +484,27 @@ export function generateTaxOptimizationRecommendations(params: {
   const eitcAmt = calculationRun.scenarios.confirmed.earned_income_tax_credit;
   if (eitcAmt > 0) {
     recommendations.push({
-      id: `rec_${profile.tax_year}_credit_eitc`,
+      id: `rec_${userId}_${profile.tax_year}_credit_eitc`,
       user_id: userId,
       tax_year: profile.tax_year,
       category: 'tax_credit',
       title: 'Earned Income Tax Credit (EITC — Schedule EIC)',
-      status: 'verified_by_document',
+      status: 'potentially_deductible_confirmation_required',
       deduction_or_credit_type: 'credit',
       gross_amount: eitcAmt,
       eligible_deduction_or_credit_amount: eitcAmt,
       estimated_real_tax_savings: eitcAmt,
       applied_rule_ref: `${ruleVersion.version_id} — IRC §32`,
       irs_citation: 'IRC §32 / IRS Publication 596',
-      calculation_explanation: `Refundable earned income credit of $${eitcAmt.toLocaleString()} based on earned income and AGI limits.`,
-      reasoning: 'Taxpayer earned income and AGI fall within statutory EITC thresholds.',
-      confidence_score: 0.97,
+      calculation_explanation: `Refundable credit of ${fmt(eitcAmt)} from the ${profile.tax_year} EIC table (earned income and AGI, ${Math.min(3, profile.qualifying_children_under_17)} qualifying child${profile.qualifying_children_under_17 === 1 ? '' : 'ren'}).`,
+      reasoning: 'Earned income and AGI fall within the EITC limits for the year.',
+      confidence_score: 0.85,
       source_transaction_ids: [],
       source_document_ids: [],
-      missing_confirmations: [],
+      missing_confirmations: [
+        `Investment income must not exceed ${fmt(rules.eitc_investment_income_limit)}`,
+        'Valid SSN, US residence more than half the year; with no qualifying child you must be 25–64',
+      ],
       created_at: now,
     });
   }
@@ -490,4 +512,11 @@ export function generateTaxOptimizationRecommendations(params: {
   return recommendations.sort(
     (a, b) => b.estimated_real_tax_savings - a.estimated_real_tax_savings
   );
+}
+
+function federalMarginal(run: CalculationRunRecord): number {
+  const s = run.scenarios.confirmed;
+  // Federal income-tax marginal rate only (QBI does not change SE tax)
+  const seShare = s.total_self_employment_tax > 0 ? 0.153 * 0.9235 : 0;
+  return Math.max(0, s.marginal_combined_rate_pct / 100 - seShare);
 }

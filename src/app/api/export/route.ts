@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthenticatedUser } from '@/lib/security/vault-and-auth';
+import { errorResponse, getAuthenticatedUser } from '@/lib/security/vault-and-auth';
 import {
   createSignedDownloadToken,
   verifySignedDownloadToken,
@@ -57,10 +57,7 @@ export async function POST(req: NextRequest) {
       format,
     });
   } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Export token issue failed' },
-      { status: 400 }
-    );
+    return errorResponse(err, 400);
   }
 }
 
@@ -102,9 +99,6 @@ export async function GET(req: NextRequest) {
       },
     });
   } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Download failed' },
-      { status: 400 }
-    );
+    return errorResponse(err, 400);
   }
 }

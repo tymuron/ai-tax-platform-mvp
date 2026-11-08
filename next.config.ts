@@ -1,7 +1,9 @@
 import type { NextConfig } from 'next';
+import path from 'path';
 
 const nextConfig: NextConfig = {
-  serverExternalPackages: ['@electric-sql/pglite', 'pdf-parse', 'tesseract.js'],
+  outputFileTracingRoot: path.join(__dirname),
+  serverExternalPackages: ['@electric-sql/pglite', 'pdf-parse', 'tesseract.js', 'pg'],
   eslint: {
     ignoreDuringBuilds: true,
   },

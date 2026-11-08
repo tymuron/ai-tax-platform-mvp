@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthenticatedUser } from '@/lib/security/vault-and-auth';
+import { errorResponse, getAuthenticatedUser } from '@/lib/security/vault-and-auth';
 import {
   getFullWorkspaceState,
   recomputeTaxWorkspaceForUser,
@@ -15,10 +15,7 @@ export async function GET(req: NextRequest) {
     const state = await getFullWorkspaceState(user.id, taxYear);
     return NextResponse.json({ ok: true, data: state });
   } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Workspace fetch failed' },
-      { status: 401 }
-    );
+    return errorResponse(err, 500);
   }
 }
 
@@ -97,9 +94,6 @@ export async function PATCH(req: NextRequest) {
 
     return NextResponse.json({ ok: true, data: updatedState });
   } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Profile update failed' },
-      { status: 400 }
-    );
+    return errorResponse(err, 400);
   }
 }

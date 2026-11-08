@@ -1,4 +1,6 @@
-import { getDb, writeAuditLog } from '@/lib/db';
+import { getDb, getStorageMode, writeAuditLog } from '@/lib/db';
+import { computeSha256 } from '@/lib/security/crypto-and-masking';
+import { isStripeConfigured } from '@/lib/services/stripe-billing';
 import {
   AIQuestionRecord,
   CalculationRunRecord,
@@ -91,8 +93,11 @@ function parseNumericRow<T>(row: T): T {
   return out as unknown as T;
 }
 
+/** Seeds the sample statements — only ever for an anonymous demo account (users.is_demo). */
 export async function ensureDemoWorkspaceSeeded(userId: string): Promise<void> {
   const db = await getDb();
+  const demoRes = await db.query<{ is_demo: boolean }>(`SELECT is_demo FROM users WHERE id = $1`, [userId]);
+  if (!demoRes.rows[0]?.is_demo) return;
   const docCountRes = await db.query<{ cnt: string }>(
     `SELECT COUNT(*)::text as cnt FROM documents WHERE user_id = $1`,
     [userId]
@@ -108,6 +113,7 @@ export async function ensureDemoWorkspaceSeeded(userId: string): Promise<void> {
       mimeType: sample.mimeType,
       buffer: Buffer.from(sample.content, 'utf8'),
       skipPipelineRecompute: true,
+      bypassTrialLimit: true,
     });
   }
 
@@ -121,13 +127,25 @@ export async function ingestDocumentForUser(params: {
   mimeType: string;
   buffer: Buffer;
   skipPipelineRecompute?: boolean;
+  bypassTrialLimit?: boolean;
 }): Promise<{
   document: DocumentRecord;
   transactionsInserted: number;
   warnings: string[];
 }> {
-  const { userId, taxYear, filename, mimeType, buffer, skipPipelineRecompute } = params;
+  const { userId, taxYear, filename, mimeType, buffer, skipPipelineRecompute, bypassTrialLimit } = params;
   const db = await getDb();
+
+  const checksum = computeSha256(buffer);
+  const dupDoc = await db.query<{ filename: string }>(
+    `SELECT filename FROM documents WHERE user_id = $1 AND tax_year = $2 AND checksum_sha256 = $3 LIMIT 1`,
+    [userId, taxYear, checksum]
+  );
+  if (dupDoc.rows[0]) {
+    throw new Error(
+      `DUPLICATE_DOCUMENT: this exact file was already uploaded as "${dupDoc.rows[0].filename}". It was not added again, so nothing is counted twice.`
+    );
+  }
 
   // Check Free Trial vs Subscription entitlement limit
   const subRes = await db.query<SubscriptionRecord>(
@@ -142,9 +160,9 @@ export async function ingestDocumentForUser(params: {
   const existingDocsCount = Number(existingDocsRes.rows[0]?.cnt || '0');
 
   if (
-    (!sub || sub.plan === 'free_trial' || sub.status !== 'active') &&
+    (!sub || sub.plan !== 'pro_monthly' || sub.status !== 'active' || !sub.stripe_webhook_verified) &&
     existingDocsCount >= 1 &&
-    !skipPipelineRecompute
+    !bypassTrialLimit
   ) {
     throw new Error(
       'FREE_TRIAL_LIMIT_REACHED: Free Trial allows uploading 1 bank statement. Upgrade to the $10/month Pro Subscription to upload unlimited tax documents, W-2s, 1099s, and receipts.'
@@ -152,7 +170,7 @@ export async function ingestDocumentForUser(params: {
   }
 
   const docId = `doc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const storagePath = saveEncryptedFileToVault(userId, docId, filename, buffer);
+  const storagePath = await saveEncryptedFileToVault(userId, docId, buffer);
   const format = detectDocumentFormat(filename, mimeType);
 
   const extraction = await extractTransactionsFromContent({
@@ -187,6 +205,17 @@ export async function ingestDocumentForUser(params: {
   });
 
   const doc = processed.document;
+  if (extraction.extractionError) {
+    doc.status = 'needs_review';
+    doc.error_message = extraction.extractionError;
+  } else if (
+    processed.transactions.length === 0 &&
+    Object.keys(extraction.extractedMetadata || {}).length === 0
+  ) {
+    doc.status = 'needs_review';
+    doc.error_message =
+      'No transactions or tax-form values could be recognised in this file. Nothing from it is used in the analysis. Upload a CSV/XLSX export or a text-based PDF, or enter the values manually.';
+  }
   await db.query(
     `INSERT INTO documents (
       id, user_id, tax_year, filename, mime_type, format, document_type,
@@ -396,12 +425,9 @@ export async function recomputeTaxWorkspaceForUser(
     );
   }
 
-  // 2. Fetch active Tax Rule Version from DB
-  const ruleRes = await db.query<TaxRuleVersionRecord>(
-    `SELECT * FROM tax_rule_versions WHERE tax_year = $1 AND status = 'active' LIMIT 1`,
-    [taxYear]
-  );
-  const ruleVersion = ruleRes.rows[0] || getTaxRulesForYear(taxYear);
+  // 2. Rule version: the code tables are the single source of truth (pinned by reference tests);
+  // the DB copy exists for audit and the admin governance view.
+  const ruleVersion: TaxRuleVersionRecord = getTaxRulesForYear(taxYear);
 
   // 3. Deterministic Tax Calculation Engine
   const calculationRun = runDeterministicTaxCalculation({
@@ -410,6 +436,7 @@ export async function recomputeTaxWorkspaceForUser(
     transactions,
     classifications,
     ruleVersion,
+    documentTypes: documents.map((d) => d.document_type),
   });
 
   await db.query(
@@ -521,7 +548,7 @@ export async function recomputeTaxWorkspaceForUser(
   );
 
   // Also record in tax_analyses
-  const analysisId = `ana_${taxYear}_${Date.now()}`;
+  const analysisId = `ana_${taxYear}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   await db.query(
     `INSERT INTO tax_analyses (
       id, user_id, tax_year, rule_version_id, status,
@@ -555,11 +582,10 @@ export async function recomputeTaxWorkspaceForUser(
 }
 
 export async function getFullWorkspaceState(userId: string, taxYear?: TaxYear) {
-  await ensureDemoWorkspaceSeeded(userId);
   const db = await getDb();
 
   const userRes = await db.query(
-    `SELECT id, email, full_name, role, status, created_at FROM users WHERE id = $1 LIMIT 1`,
+    `SELECT id, email, full_name, role, status, is_demo, created_at FROM users WHERE id = $1 LIMIT 1`,
     [userId]
   );
   const user = userRes.rows[0];
@@ -648,10 +674,48 @@ export async function getFullWorkspaceState(userId: string, taxYear?: TaxYear) {
     exportPurchases,
     ratings,
     serviceConfigStatus: {
-      openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
-      stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY),
-      databaseEngine: 'PostgreSQL 16 (Embedded PGlite + RLS Tenant Isolation)',
-      privateVaultEncryption: 'AES-256-GCM + HMAC-SHA256 Signed Links',
+      // Classification is rule-based; no external AI model is called by this build.
+      openaiConfigured: false,
+      aiMode: 'rule_based',
+      stripeConfigured: isStripeConfigured(),
+      storageMode: getStorageMode(),
+      databaseEngine:
+        getStorageMode() === 'postgres'
+          ? 'PostgreSQL (DATABASE_URL)'
+          : getStorageMode() === 'embedded_ephemeral'
+          ? 'Temporary demo storage — data is lost when the server restarts'
+          : 'Embedded PostgreSQL (local file)',
+      privateVaultEncryption: 'AES-256-GCM, files kept in the database; signed 15-minute download links',
     },
   };
+}
+
+/** Creates the per-user profile row with neutral defaults (nothing pre-filled about the person). */
+export async function createProfileForUser(userId: string): Promise<void> {
+  const db = await getDb();
+  const now = new Date().toISOString();
+  await db.query(
+    `INSERT INTO user_profiles (user_id, tax_year, filing_status, state_code, business_type, industry_code,
+       has_w2_income, has_1099_income, has_schedule_c, home_total_sqft, updated_at)
+     VALUES ($1, 2025, 'single', 'CA', 'Sole proprietor / freelancer', 'Not specified', TRUE, TRUE, TRUE, 0, $2)
+     ON CONFLICT (user_id) DO NOTHING`,
+    [userId, now]
+  );
+}
+
+/** Sample profile used only for anonymous demo accounts. */
+export async function applyDemoProfile(userId: string): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `UPDATE user_profiles SET
+       business_type = 'Sole proprietor — consultant (sample data)', industry_code = '541611',
+       dependents_count = 1, qualifying_children_under_17 = 1, child_care_expenses_paid = 3200,
+       home_total_sqft = 1600, home_office_sqft = 220, home_office_exclusive_regular_use = FALSE,
+       home_annual_rent_or_mortgage_interest = 32400, home_annual_utilities_insurance = 4200,
+       vehicle_total_miles = 12000, vehicle_business_miles = 4850, vehicle_actual_expenses = 3100,
+       self_employed_health_insurance_premiums = 5400, sep_ira_solo_401k_contributions = 8000,
+       estimated_tax_payments_made = 6500, updated_at = $2
+     WHERE user_id = $1`,
+    [userId, new Date().toISOString()]
+  );
 }

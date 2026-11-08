@@ -104,7 +104,7 @@ export function generateContextualInterviewQuestions(params: {
     }
 
     generated.push({
-      id: `aiq_${Date.now()}_${normKey.slice(0, 12)}`,
+      id: `aiq_${userId}_${questionKey}`,
       user_id: userId,
       tax_year: taxYear,
       related_transaction_ids: group.txIds,
@@ -125,7 +125,7 @@ export function generateContextualInterviewQuestions(params: {
     generated.push(existingByKey.get(homeOfficeKey)!);
   } else if (profile.has_schedule_c) {
     generated.push({
-      id: `aiq_${taxYear}_home_office`,
+      id: `aiq_${userId}_${homeOfficeKey}`,
       user_id: userId,
       tax_year: taxYear,
       related_transaction_ids: [],
@@ -150,20 +150,20 @@ export function generateContextualInterviewQuestions(params: {
     generated.push(existingByKey.get(mileageKey)!);
   } else if (profile.has_schedule_c && profile.vehicle_business_miles > 0) {
     generated.push({
-      id: `aiq_${taxYear}_vehicle_mileage`,
+      id: `aiq_${userId}_${mileageKey}`,
       user_id: userId,
       tax_year: taxYear,
       related_transaction_ids: [],
       question_key: mileageKey,
       category: 'vehicle_mileage',
       question_text: `You have ${profile.vehicle_business_miles.toLocaleString()} business miles recorded out of ${profile.vehicle_total_miles.toLocaleString()} total miles in ${taxYear}. Do you maintain a written or app-based mileage log under IRC §274(d)?`,
-      context_summary: `Standard Mileage Rate (${taxYear === 2025 ? '70¢' : '71¢'}/mile) vs. Actual Vehicle Expense comparison.`,
+      context_summary: `Standard mileage rate (${taxYear === 2025 ? '70¢' : '72.5¢ Jan–Jun, 76¢ from 1 Jul'}/mile) vs. actual vehicle expenses. Without a log the mileage stays in the unconfirmed scenario.`,
       options: [
         { value: '100_business', label: 'Yes — contemporaneous mileage log maintained', business_use_pct: 100 },
         { value: 'personal_use', label: 'No log maintained — exclude mileage deduction', business_use_pct: 0 },
         { value: 'not_sure', label: 'Not sure' },
       ],
-      status: 'pending',
+      status: profile.vehicle_mileage_log_confirmed ? 'answered' : 'pending',
       priority: 3,
       created_at: now,
     });

@@ -57,8 +57,8 @@ export function runQualityAssuranceEngine(params: {
   checks.push({
     check_key: 'date_and_amount_accuracy',
     label: 'Date & Amount Extraction Integrity',
-    passed: true,
-    details: `${validDateAmountCount}/${transactions.length} transactions have verified dates and amounts (${dateAmountAccuracy}%). Uncertain rows isolated.`,
+    passed: needsReviewTxs.length === 0,
+    details: `${validDateAmountCount}/${transactions.length} transactions have a recognised date and amount (${dateAmountAccuracy}%). ${needsReviewTxs.length} row(s) need your confirmation and are left out of every total until confirmed.`,
   });
 
   // Check 2: Zero duplicate inclusion
@@ -137,7 +137,7 @@ export function runQualityAssuranceEngine(params: {
   const expectedTotalTax = round2(
     conf.federal_income_tax_after_credits +
       conf.total_self_employment_tax +
-      conf.estimated_state_income_tax
+      conf.additional_medicare_tax
   );
   const totalTaxMatches =
     Math.abs(expectedTotalTax - conf.total_estimated_tax_liability) <= 0.02;
@@ -240,7 +240,12 @@ export function runQualityAssuranceEngine(params: {
   let overallStatus: QualityAssuranceResult['overall_status'] = 'verified';
   if (blockingIssues.length > 0) {
     overallStatus = 'blocked';
-  } else if (needsReviewTxs.length > 0 || missingPageDocs.length > 0 || unsupportedEntity) {
+  } else if (
+    needsReviewTxs.length > 0 ||
+    missingPageDocs.length > 0 ||
+    unsupportedEntity ||
+    documents.some((d) => d.status === 'needs_review' || d.status === 'failed')
+  ) {
     overallStatus = 'needs_review';
   }
 
@@ -402,7 +407,7 @@ export function buildStructuredTaxOptimizationReport(params: {
   const additionalPotentialSavings = Math.max(0, round2(confTax - potTax));
 
   return {
-    id: `rep_${profile.tax_year}_${Date.now()}`,
+    id: `rep_${profile.tax_year}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     user_id: userId,
     tax_year: profile.tax_year,
     calculation_run_id: calculationRun.id,
@@ -418,10 +423,12 @@ export function buildStructuredTaxOptimizationReport(params: {
         state_code: profile.state_code,
         completeness_warnings: qaResult.warnings,
         assumptions_and_limitations: [
-          `Calculations apply deterministic federal and ${profile.state_code} state tax rules under version ${calculationRun.rule_version_id}.`,
+          `Federal calculations use rule version ${calculationRun.rule_version_id}. State income tax (${profile.state_code}) is not calculated and is not included in any total.`,
           'Inter-account transfers and credit card repayments are strictly excluded from income and expenses.',
           'Potential deductions marked "Confirmation Required" or "Additional Information Required" are isolated in Scenario 3 and are NOT included in the Confirmed Optimization Scenario.',
-          'Remember: A $10,000 business expense deduction reduces taxable income, not tax dollar-for-dollar; real tax savings depend on your marginal federal, self-employment, and state tax brackets.',
+          'A $10,000 business expense reduces taxable income, not tax dollar-for-dollar; the estimated tax impact depends on your federal brackets, self-employment tax and credit phase-outs.',
+          'Only the standard deduction is used; itemized deductions are not calculated.',
+          'Estimates only — not tax advice and not a filed return. Review before you file.',
         ],
         legal_disclaimer:
           'AI Tax is an analytical software platform for document analysis and estimated tax impact modeling. AI Tax does not file tax returns with the IRS, does not sign tax returns as a Paid Tax Return Preparer, and does not provide formal legal representation. Users must independently review, verify substantiating records, and approve all figures before filing.',

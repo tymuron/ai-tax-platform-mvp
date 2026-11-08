@@ -1,29 +1,39 @@
-# AI Tax v2.0 — Testing Strategy & Reference Cases (`TESTING.md`)
-
-## Running the Automated Test Suite
+# Testing (`TESTING.md`)
 
 ```bash
-cd /Users/tymurchystiakov/antigravity-workspace/playground/ai-tax
-npm test
+npm test          # vitest, 45 tests
+npm run typecheck
+npm run build
 ```
 
-## Reference Test Cases (`src/tests/tax-engine.test.ts`)
-Critical tax calculations require a **100% exact match** against approved reference cases:
+## Reference cases (`src/tests/tax-engine.test.ts`)
 
-1. **Reference Case 1 — 2025 Federal Progressive Brackets (`Single`, `$60,000` Taxable Income)**:
-   - `10%` on first `$11,925` = `$1,192.50`
-   - `12%` on next `$36,550` (`$11,925` to `$48,475`) = `$4,386.00`
-   - `22%` on remaining `$11,525` (`$48,475` to `$60,000`) = `$2,535.50`
-   - **Expected & Verified Result**: `$8,114.00` (`22%` marginal rate).
-2. **Reference Case 2 — Home Office Simplified vs. Regular Method + IRC §280A Profit Cap**:
-   - `200 sq ft` of `2,000 sq ft` home (`10%` business ratio) with `$27,600` annual housing costs.
-   - Simplified (`$1,000`) vs. Regular (`$2,760`) -> selects optimal `$2,760`.
-   - When tentative Schedule C profit is `$800`, caps deduction at `$800`.
-3. **Reference Case 3 — Business Vehicle Mileage (`70¢/mile` for 2025) vs. Actual Expenses**:
-   - `4,000` business miles out of `10,000` total miles -> `$2,800` Standard Mileage vs. `$800` Actual -> selects `$2,800`.
-4. **Reference Case 4 — Multi-Transaction Reconciliation, Guardrails & 3-Scenario Separation**:
-   - Verifies inter-account transfers (`$8,000`) and credit card repayments (`$3,200`) are classified as `Non-expense transactions` and excluded from gross income and deductions.
-   - Verifies ambiguous merchant (`Amazon.com $1,500`) is classified as `additional_info_required` and excluded from the Confirmed Optimization Scenario until confirmed by the user.
-   - Verifies that `$15,560` in confirmed Schedule C deductions yields exact marginal tax savings rather than a false 1:1 `$15,560` tax reduction.
-5. **Reference Case 5 — Security, PII Masking, Signed Links, Stripe Webhook HMAC & 16 DB Tables**:
-   - Verifies SSN/EIN/Card/Email masking, cross-tenant token rejection, Stripe webhook tamper rejection, and presence of all 16 required PostgreSQL tables.
+Every expected value was derived by hand from the IRS source cited in `seed-rules.ts`. They must match exactly; a change that moves one is a change in tax results.
+
+| Case | Expected |
+| --- | --- |
+| 2025 single, taxable income $60,000 (Tax Table, midpoint $60,025) | $8,120 |
+| 2025 single, $150,000 (worksheet) | $28,847.00 |
+| 2026 MFJ, $250,000 (worksheet) | $45,196.00 |
+| EITC 2025 single, 1 child: $20,000 / $40,000 / $50,434 | $4,328 / $1,663 / $0 |
+| EITC 2025 single, no child, $5,000 | $384 |
+| EITC 2026 MFJ, 2 children, $30,000 | $7,316 |
+| §21 rate: 2025 at $30k / $50k; 2026 at $30k, $100k single, $200k MFJ | 27% / 20%; 42%, 22%, 22% |
+| Schedule C single 2025 — baseline profit $120,000 | total federal tax $28,727.46 (SE $16,955.46, QBI $19,154.45, tax $11,772) |
+| … confirmed (profit $80,000) | $16,690.64, $12,036.82 below baseline |
+| … potential (profit $40,000) | $7,468.82, $21,258.64 below baseline |
+| HOH, 2 children, $30,000 wages, 2025 | tax $638 fully offset; ACTC $3,400; EITC $5,746; net −$9,146 |
+| Mileage 2025: 4,000 mi | $2,800, and fuel on the statement not counted again |
+| Mileage 2026: 600 mi before + 400 mi after 1 July | $739.00 |
+
+Guard tests: §179 refused at ≤50% business use; CA state tax "not calculated" (totals equal TX); rows needing review excluded; unsupported entity → "Additional tax review required"; merchant names never "verified"; real text PDF parsed; unreadable PDF → error, no rows.
+
+## Security and payment tests (`src/tests/security-and-payments.test.ts`)
+
+No seeded accounts; salted password hashes; `x-user-id` / unsigned cookie rejected; tampered session rejected; admin role required; new account starts empty; tenant isolation; duplicate file rejected; free-trial limit; demo data private and labelled; signed links expire and are user-bound; PII masking; forged Stripe signature rejected; verified webhook grants an export once (idempotent).
+
+## Not covered by automated tests
+
+- OCR on real phone photos (needs the tesseract model download).
+- Real Stripe Checkout end-to-end (needs test keys + `stripe listen`).
+- Classification accuracy on a representative set of real statements — required by spec §9 before launch.

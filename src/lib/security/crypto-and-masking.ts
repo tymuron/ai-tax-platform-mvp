@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { getSecret } from '@/lib/security/secrets';
 
 const PII_PATTERNS: Array<{ pattern: RegExp; replacement: string }> = [
   // US SSN (XXX-XX-XXXX)
@@ -27,9 +28,6 @@ export function maskSensitivePII(input: string): string {
   return sanitized;
 }
 
-const SIGNING_SECRET =
-  process.env.FILE_SIGNING_SECRET ||
-  'ai-tax-v2-server-hmac-secret-key-do-not-expose-to-client-2026';
 
 /**
  * Generates a temporary HMAC-SHA256 signed token for private file or export downloads.
@@ -52,7 +50,7 @@ export function createSignedDownloadToken(params: {
   });
   const encodedPayload = Buffer.from(payload, 'utf8').toString('base64url');
   const signature = crypto
-    .createHmac('sha256', SIGNING_SECRET)
+    .createHmac('sha256', getSecret('FILE_SIGNING_SECRET'))
     .update(encodedPayload)
     .digest('base64url');
   return {
@@ -82,7 +80,7 @@ export function verifySignedDownloadToken(token: string, expectedUserId?: string
     }
     const [encodedPayload, providedSig] = parts;
     const expectedSig = crypto
-      .createHmac('sha256', SIGNING_SECRET)
+      .createHmac('sha256', getSecret('FILE_SIGNING_SECRET'))
       .update(encodedPayload)
       .digest('base64url');
 
@@ -122,7 +120,17 @@ export function computeSha256(buffer: Buffer | string): string {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
+/** scrypt with a random per-user salt, stored as "scrypt:<salt>:<hash>". */
 export function hashPassword(password: string): string {
-  const salt = 'ai-tax-v2-pbkdf2-salt';
-  return crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return ['scrypt', salt, hash].join(':');
+}
+
+export function verifyPassword(password: string, stored: string): boolean {
+  const parts = stored.split(':');
+  if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+  const expected = Buffer.from(parts[2], 'hex');
+  const actual = crypto.scryptSync(password, parts[1], expected.length);
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }

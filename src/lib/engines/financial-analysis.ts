@@ -22,6 +22,8 @@ const AMBIGUOUS_MERCHANTS = [
 
 export function isAmbiguousMerchant(merchantOrDesc: string): boolean {
   const lower = merchantOrDesc.toLowerCase();
+  // Cloud services are not general retail purchases
+  if (/amazon web services|\baws\b/.test(lower)) return false;
   return AMBIGUOUS_MERCHANTS.some((m) => lower.includes(m));
 }
 
@@ -253,7 +255,7 @@ export function classifyTransactionRecord(params: {
     group = 'Business expenses';
     subType = 'operating_expense';
     scheduleCCategory = 'advertising_and_marketing';
-    evidenceClassification = 'verified_by_document';
+    evidenceClassification = 'potentially_deductible_confirmation_required';
     businessUsePct = 100;
     confidence = 0.94;
     appliedRuleRef = 'IRC §162(a) / Schedule C Line 8 (Advertising)';
@@ -283,7 +285,7 @@ export function classifyTransactionRecord(params: {
     group = 'Business expenses';
     subType = 'operating_expense';
     scheduleCCategory = 'professional_services';
-    evidenceClassification = 'verified_by_document';
+    evidenceClassification = 'potentially_deductible_confirmation_required';
     businessUsePct = 100;
     confidence = 0.95;
     appliedRuleRef = 'IRC §162(a) / Schedule C Line 17 (Legal and Professional Services)';
@@ -292,7 +294,7 @@ export function classifyTransactionRecord(params: {
     group = 'Business expenses';
     subType = 'operating_expense';
     scheduleCCategory = 'business_insurance';
-    evidenceClassification = 'verified_by_document';
+    evidenceClassification = 'potentially_deductible_confirmation_required';
     businessUsePct = 100;
     confidence = 0.96;
     appliedRuleRef = 'IRC §162(a) / Schedule C Line 15 (Insurance, other than health)';
@@ -334,7 +336,7 @@ export function classifyTransactionRecord(params: {
     group = 'Business expenses';
     subType = 'operating_expense';
     scheduleCCategory = 'rent';
-    evidenceClassification = 'verified_by_document';
+    evidenceClassification = 'potentially_deductible_confirmation_required';
     businessUsePct = 100;
     confidence = 0.95;
     appliedRuleRef = 'IRC §162(a)(3) / Schedule C Line 20b (Rent or Lease — Other Business Property)';
@@ -343,7 +345,7 @@ export function classifyTransactionRecord(params: {
     group = 'Business expenses';
     subType = 'operating_expense';
     scheduleCCategory = 'office_expenses';
-    evidenceClassification = 'verified_by_document';
+    evidenceClassification = 'potentially_deductible_confirmation_required';
     businessUsePct = 100;
     confidence = 0.93;
     appliedRuleRef = 'IRC §162(a) / Schedule C Line 18 (Office Expense)';

@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useState, useCallback } from 'react';
+import AuthScreen from './auth-screen';
 import {
   ShieldCheck,
   FileText,
@@ -58,6 +59,8 @@ interface WorkspacePayload {
   ratings: RatingRecord[];
   serviceConfigStatus: {
     openaiConfigured: boolean;
+    aiMode?: string;
+    storageMode?: 'postgres' | 'embedded_persistent' | 'embedded_ephemeral' | 'memory';
     stripeConfigured: boolean;
     databaseEngine: string;
     privateVaultEncryption: string;
@@ -139,6 +142,12 @@ function fmtUsd(val: number | undefined | null): string {
   })}`;
 }
 
+const US_STATES = [
+  'AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO',
+  'MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY',
+];
+const NO_WAGE_TAX_STATES = ['AK', 'FL', 'NV', 'NH', 'SD', 'TN', 'TX', 'WA', 'WY'];
+
 export default function AITaxPlatformApp() {
   const [activeTab, setActiveTab] = useState<
     'overview' | 'documents' | 'ledger' | 'interview' | 'scenarios' | 'report' | 'export' | 'admin'
@@ -147,6 +156,7 @@ export default function AITaxPlatformApp() {
   const [workspace, setWorkspace] = useState<WorkspacePayload | null>(null);
   const [adminData, setAdminData] = useState<AdminPayload | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const [signedOut, setSignedOut] = useState<boolean>(false);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [alertMessage, setAlertMessage] = useState<{
     type: 'success' | 'warning' | 'error';
@@ -165,8 +175,14 @@ export default function AITaxPlatformApp() {
     setLoading(true);
     try {
       const res = await fetch(`/api/workspace?taxYear=${year}`);
+      if (res.status === 401 || res.status === 403) {
+        setWorkspace(null);
+        setSignedOut(true);
+        return;
+      }
       const json = await res.json();
       if (json.ok) {
+        setSignedOut(false);
         setWorkspace(json.data);
       } else {
         setAlertMessage({ type: 'error', text: json.error || 'Failed to load workspace' });
@@ -193,6 +209,26 @@ export default function AITaxPlatformApp() {
   useEffect(() => {
     loadWorkspace(taxYear);
   }, [taxYear, loadWorkspace]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const checkout = params.get('checkout');
+    if (checkout === 'success') {
+      setAlertMessage({
+        type: 'success',
+        text: 'Payment received by Stripe. Access unlocks as soon as Stripe confirms it to our server (usually a few seconds) — refresh if it has not appeared.',
+      });
+    } else if (checkout === 'cancelled') {
+      setAlertMessage({ type: 'warning', text: 'Checkout was cancelled. You were not charged.' });
+    }
+    if (checkout) window.history.replaceState(null, '', window.location.pathname);
+  }, []);
+
+  async function handleLogout() {
+    await fetch('/api/auth/logout', { method: 'POST' });
+    setWorkspace(null);
+    setSignedOut(true);
+  }
 
   useEffect(() => {
     if (activeTab === 'admin') {
@@ -249,13 +285,13 @@ export default function AITaxPlatformApp() {
               ].join('\n'),
             }
           : {
-              filename: `2025_Scanned_Receipt_Bundle_OCR.pdf`,
-              mimeType: 'application/pdf',
+              filename: `${taxYear}_Receipts_With_Unreadable_Row.csv`,
+              mimeType: 'text/csv',
               taxYear,
               content: [
-                'OCR_SCAN Page 1 of 2',
-                `${taxYear}-09-14 | Hilton Hotel Conference Lodging | $680.00 | outflow`,
-                `????-??-?? | Blurry Thermal Receipt Unclear Date | $195.00 | outflow`,
+                'Date,Description,Amount,Direction,Currency',
+                `${taxYear}-09-14,Hilton Hotel Conference Lodging,680.00,outflow,USD`,
+                `????-??-??,Blurry Thermal Receipt Unclear Date,195.00,outflow,USD`,
               ].join('\n'),
             };
 
@@ -363,20 +399,24 @@ export default function AITaxPlatformApp() {
     action: 'subscribe_pro' | 'downgrade_free_trial' | 'purchase_export_package',
     exportTier?: 'essential_50' | 'professional_100' | 'complete_audit_200'
   ) {
-    setBusyMessage('Processing payment & verifying server Stripe webhook signature...');
+    setBusyMessage(action === 'downgrade_free_trial' ? 'Cancelling subscription…' : 'Opening secure Stripe checkout…');
     try {
       const res = await fetch('/api/stripe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, exportTier, taxYear }),
+        body: JSON.stringify({
+          action: action === 'downgrade_free_trial' ? 'cancel_subscription' : action,
+          exportTier,
+          taxYear,
+        }),
       });
       const json = await res.json();
-      if (json.ok) {
-        setWorkspace(json.data);
-        setAlertMessage({
-          type: 'success',
-          text: `Stripe webhook verified on server! Entitlement granted: ${json.entitlementGranted}.`,
-        });
+      if (json.ok && json.checkoutUrl) {
+        window.location.href = json.checkoutUrl;
+        return;
+      } else if (json.ok) {
+        setAlertMessage({ type: 'success', text: json.message || 'Done.' });
+        loadWorkspace(taxYear);
       } else {
         setAlertMessage({ type: 'error', text: json.error });
       }
@@ -452,17 +492,28 @@ export default function AITaxPlatformApp() {
     }
   }
 
+  if (signedOut) {
+    return (
+      <AuthScreen
+        onSignedIn={() => {
+          setSignedOut(false);
+          loadWorkspace(taxYear);
+        }}
+      />
+    );
+  }
+
   if (loading || !workspace) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center bg-slate-950 text-white p-6">
         <div className="flex items-center gap-3 mb-4">
           <RefreshCw className="w-7 h-7 text-sky-400 animate-spin" />
           <span className="text-xl font-semibold tracking-tight">
-            Initializing AI Tax v2.0 Deterministic Engine...
+            Loading your workspace…
           </span>
         </div>
         <p className="text-sm text-slate-400 max-w-md text-center">
-          Loading PostgreSQL database, IRS {taxYear} rule versions, document vault, and QA verification gates.
+          Loading documents, IRS {taxYear} rule tables and checks.
         </p>
       </div>
     );
@@ -532,10 +583,7 @@ export default function AITaxPlatformApp() {
             </span>
             <span className="hidden lg:inline text-slate-400">|</span>
             <span className="hidden lg:inline text-slate-300">
-              AI Mode:{' '}
-              {serviceConfigStatus.openaiConfigured
-                ? 'OpenAI API Live'
-                : 'Safe Deterministic Hybrid Mode (PII Masked)'}
+              Classification: rule-based (no external AI model connected)
             </span>
           </div>
           <div className="flex items-center gap-3">
@@ -546,9 +594,9 @@ export default function AITaxPlatformApp() {
                   : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
               }`}
             >
-              {subscription?.plan === 'pro_monthly'
-                ? 'Pro Workspace ($10/mo Active)'
-                : 'Free Trial (1 Statement Limit)'}
+              {subscription?.plan === 'pro_monthly' && subscription?.status === 'active' && subscription?.stripe_webhook_verified
+                ? 'Full workspace ($10/mo)'
+                : 'Free trial (1 statement)'}
             </span>
             <span
               className={`px-2 py-0.5 rounded font-semibold ${
@@ -562,6 +610,18 @@ export default function AITaxPlatformApp() {
           </div>
         </div>
       </div>
+
+      {serviceConfigStatus.storageMode === 'embedded_ephemeral' && (
+        <div className="bg-amber-100 border-b border-amber-300 text-amber-900 text-xs px-4 py-2 text-center">
+          Preview server: data is kept in temporary storage and can disappear at any time. Do not upload real
+          financial documents here.
+        </div>
+      )}
+      {(workspace.user as { is_demo?: boolean }).is_demo && (
+        <div className="bg-sky-50 border-b border-sky-200 text-sky-900 text-xs px-4 py-2 text-center">
+          Demo account — every statement and figure here is made-up sample data.
+        </div>
+      )}
 
       {/* Main Header & Navigation */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
@@ -617,6 +677,12 @@ export default function AITaxPlatformApp() {
                 {profile.filing_status.replace(/_/g, ' ').toUpperCase()} • State: {profile.state_code}
               </div>
             </div>
+            <button
+              onClick={handleLogout}
+              className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50"
+            >
+              Sign out
+            </button>
           </div>
         </div>
 
@@ -719,7 +785,7 @@ export default function AITaxPlatformApp() {
                     IRS {taxYear} Deterministic Tax Engine ({payload.header.rule_version_id})
                   </div>
                   <h2 className="text-2xl font-bold tracking-tight">
-                    Find Every Legal Tax-Saving Opportunity. Calculate Its Real Financial Impact.
+                    Potential deductions and their estimated federal tax impact
                   </h2>
                   <p className="text-xs text-slate-300 leading-relaxed max-w-2xl">
                     AI Tax separates <strong>gross expenses</strong> from{' '}
@@ -730,7 +796,7 @@ export default function AITaxPlatformApp() {
                 </div>
                 <div className="bg-white/10 backdrop-blur rounded-xl p-4 border border-white/15 space-y-2">
                   <div className="text-xs text-sky-200 font-medium">
-                    Confirmed Real Tax Liability Savings
+                    Estimated federal tax impact of confirmed items
                   </div>
                   <div className="text-3xl font-extrabold text-emerald-400">
                     {fmtUsd(payload.estimated_tax_impact.confirmed_real_tax_savings)}
@@ -743,8 +809,8 @@ export default function AITaxPlatformApp() {
                           .additional_potential_tax_savings_requiring_confirmation
                       )}
                     </strong>{' '}
-                    in additional potential tax savings awaiting your confirmation in the AI
-                    Interview.
+                    more is possible if the items awaiting your confirmation hold up. Estimates only; state tax
+                    not included; not a guarantee of savings or a refund.
                   </div>
                 </div>
               </div>
@@ -754,7 +820,7 @@ export default function AITaxPlatformApp() {
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
               <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
                 <div className="text-xs font-medium text-slate-500">
-                  Baseline Estimated Tax
+                  Baseline estimated federal tax
                 </div>
                 <div className="text-2xl font-bold text-slate-900 mt-1">
                   {fmtUsd(baseScenario.total_estimated_tax_liability)}
@@ -768,17 +834,17 @@ export default function AITaxPlatformApp() {
               <div className="bg-white p-4 rounded-xl border-2 border-emerald-500/70 shadow-sm">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-emerald-800">
-                    Confirmed Optimized Tax
+                    Confirmed scenario tax
                   </span>
                   <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold">
-                    VERIFIED
+                    CONFIRMED ITEMS
                   </span>
                 </div>
                 <div className="text-2xl font-bold text-emerald-700 mt-1">
                   {fmtUsd(confScenario.total_estimated_tax_liability)}
                 </div>
                 <div className="text-[11px] text-emerald-700 font-medium mt-1">
-                  Saves {fmtUsd(confScenario.savings_vs_baseline)} vs. Baseline
+                  {fmtUsd(confScenario.savings_vs_baseline)} lower than baseline (estimate)
                 </div>
               </div>
 
@@ -795,7 +861,7 @@ export default function AITaxPlatformApp() {
                   {fmtUsd(potScenario.total_estimated_tax_liability)}
                 </div>
                 <div className="text-[11px] text-amber-800 mt-1">
-                  Up to {fmtUsd(potScenario.savings_vs_baseline)} total savings if substantiated
+                  {fmtUsd(potScenario.savings_vs_baseline)} lower than baseline if every item is confirmed
                 </div>
               </div>
 
@@ -863,14 +929,12 @@ export default function AITaxPlatformApp() {
                       }
                       className="w-full rounded-lg border border-slate-300 px-2.5 py-2 bg-white text-slate-900"
                     >
-                      <option value="CA">California (CA - 6.5% eff)</option>
-                      <option value="NY">New York (NY - 6.0% eff)</option>
-                      <option value="TX">Texas (TX - 0% state tax)</option>
-                      <option value="FL">Florida (FL - 0% state tax)</option>
-                      <option value="WA">Washington (WA - 0% state tax)</option>
-                      <option value="IL">Illinois (IL - 4.95%)</option>
-                      <option value="MA">Massachusetts (MA - 5.0%)</option>
-                      <option value="CO">Colorado (CO - 4.4%)</option>
+                      {US_STATES.map((st) => (
+                        <option key={st} value={st}>
+                          {st}
+                          {NO_WAGE_TAX_STATES.includes(st) ? ' — no state income tax on wages' : ' — state tax not calculated'}
+                        </option>
+                      ))}
                     </select>
                   </div>
 
@@ -916,7 +980,7 @@ export default function AITaxPlatformApp() {
 
                   <div>
                     <label className="block font-semibold text-slate-700 mb-1">
-                      Business Vehicle Miles ({taxYear === 2025 ? '70¢' : '71¢'}/mi)
+                      Business Vehicle Miles ({taxYear === 2025 ? '70¢' : '72.5¢ / 76¢ from Jul'}/mi)
                     </label>
                     <input
                       type="number"
@@ -1608,10 +1672,10 @@ export default function AITaxPlatformApp() {
                         p: potScenario.regular_federal_income_tax,
                       },
                       {
-                        label: 'Federal Tax Credits (CTC, Child Care, Education, EITC)',
-                        b: baseScenario.total_tax_credits,
-                        c: confScenario.total_tax_credits,
-                        p: potScenario.total_tax_credits,
+                        label: 'Non-refundable credits used (CTC, child care, education)',
+                        b: baseScenario.nonrefundable_credits_used,
+                        c: confScenario.nonrefundable_credits_used,
+                        p: potScenario.nonrefundable_credits_used,
                       },
                       {
                         label: 'Federal Income Tax After Credits',
@@ -1620,20 +1684,32 @@ export default function AITaxPlatformApp() {
                         p: potScenario.federal_income_tax_after_credits,
                       },
                       {
-                        label: `Estimated State Income Tax (${profile.state_code})`,
-                        b: baseScenario.estimated_state_income_tax,
-                        c: confScenario.estimated_state_income_tax,
-                        p: potScenario.estimated_state_income_tax,
+                        label: 'Self-employment tax + Additional Medicare tax',
+                        b: baseScenario.total_self_employment_tax + baseScenario.additional_medicare_tax,
+                        c: confScenario.total_self_employment_tax + confScenario.additional_medicare_tax,
+                        p: potScenario.total_self_employment_tax + potScenario.additional_medicare_tax,
                       },
                       {
-                        label: 'Total Estimated Tax Liability (Federal + SE Tax + State)',
+                        label: 'Total federal tax (Form 1040 line 24)',
                         b: baseScenario.total_estimated_tax_liability,
                         c: confScenario.total_estimated_tax_liability,
                         p: potScenario.total_estimated_tax_liability,
                         bold: true,
                       },
                       {
-                        label: 'Real Tax Liability Savings vs. Baseline',
+                        label: 'Refundable credits (EITC, additional CTC, AOTC 40%)',
+                        b: baseScenario.refundable_credits,
+                        c: confScenario.refundable_credits,
+                        p: potScenario.refundable_credits,
+                      },
+                      {
+                        label: `State income tax (${profile.state_code}) — ${baseScenario.state_tax_status === 'no_wage_income_tax' ? 'none on wages' : 'not calculated, not included'}`,
+                        b: 0,
+                        c: 0,
+                        p: 0,
+                      },
+                      {
+                        label: 'Estimated federal tax difference vs. baseline',
                         b: 0,
                         c: confScenario.savings_vs_baseline,
                         p: potScenario.savings_vs_baseline,
@@ -1745,7 +1821,7 @@ export default function AITaxPlatformApp() {
             {/* Potential Tax Deductions & Special Regimes */}
             <div className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
               <h3 className="text-base font-bold text-slate-900">
-                Traceable Tax Deductions, Credits & Real Tax Savings Breakdown
+                Potential deductions and credits, with estimated tax impact
               </h3>
               <p className="text-xs text-slate-600 bg-sky-50 border border-sky-200 p-3 rounded-lg">
                 <strong>Crucial Distinction:</strong>{' '}
@@ -1780,7 +1856,7 @@ export default function AITaxPlatformApp() {
                               </strong>
                             </div>
                             <div className="px-2.5 py-1 rounded bg-emerald-50 border border-emerald-200 text-emerald-900 font-bold">
-                              Real Tax Savings: {fmtUsd(rec.estimated_real_tax_savings)}
+                              Estimated tax impact: {fmtUsd(rec.estimated_real_tax_savings)}
                             </div>
                           </div>
                         </div>
@@ -1854,7 +1930,7 @@ export default function AITaxPlatformApp() {
                   Tax Preparation & Audit Workpaper Export Package
                 </h3>
                 <p className="text-xs text-slate-600">
-                  Transparent one-time fee for the downloadable PDF, CSV, and multi-sheet XLSX Schedule C/SE workpaper package. Verified on the server via HMAC-signed Stripe webhook.
+                  Transparent one-time fee for the downloadable PDF, CSV, and multi-sheet XLSX Schedule C/SE workpaper package. Paid through Stripe Checkout; access unlocks only after Stripe confirms the payment to our server.
                 </p>
                 <div className="grid grid-cols-3 gap-2 pt-1">
                   {[

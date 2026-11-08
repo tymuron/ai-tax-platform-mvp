@@ -1,108 +1,77 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthenticatedUser } from '@/lib/security/vault-and-auth';
+import { errorResponse, getAuthenticatedUser } from '@/lib/security/vault-and-auth';
 import {
-  processVerifiedStripeWebhookEvent,
-  signStripeWebhookPayload,
-  verifyStripeWebhookSignature,
-} from '@/lib/services/payment-and-export-service';
-import { getFullWorkspaceState } from '@/lib/services/workspace-service';
-import { TaxYear } from '@/types/tax';
+  cancelSubscriptionAtPeriodEnd,
+  constructVerifiedEvent,
+  createCheckoutSession,
+  handleVerifiedStripeEvent,
+  isStripeConfigured,
+  PaymentsNotConfiguredError,
+} from '@/lib/services/stripe-billing';
+import { getDb } from '@/lib/db';
+import { ExportPurchaseRecord } from '@/types/tax';
 
+export const runtime = 'nodejs';
+
+/**
+ * POST with a Stripe-Signature header  -> Stripe webhook (the only place entitlements are granted)
+ * POST from a signed-in user            -> starts Stripe Checkout and returns its URL
+ */
 export async function POST(req: NextRequest) {
+  const rawBody = await req.text();
+  const signature = req.headers.get('stripe-signature');
+
+  if (signature) {
+    if (!isStripeConfigured()) {
+      return NextResponse.json({ ok: false, error: 'Webhook received but Stripe is not configured' }, { status: 503 });
+    }
+    let event;
+    try {
+      event = constructVerifiedEvent(rawBody, signature);
+    } catch {
+      return NextResponse.json({ ok: false, error: 'Invalid Stripe signature' }, { status: 400 });
+    }
+    try {
+      const applied = await handleVerifiedStripeEvent(event);
+      return NextResponse.json({ ok: true, received: true, duplicate: !applied });
+    } catch (err) {
+      return errorResponse(err, 500); // non-2xx makes Stripe retry
+    }
+  }
+
   try {
-    const rawBody = await req.text();
-    const sigHeader = req.headers.get('stripe-signature');
-
-    // Mode 1: Direct Stripe Webhook with Stripe-Signature header
-    if (sigHeader) {
-      const verification = verifyStripeWebhookSignature(rawBody, sigHeader);
-      if (!verification.verified) {
-        return NextResponse.json(
-          { ok: false, error: `Stripe webhook verification failed: ${verification.reason}` },
-          { status: 400 }
-        );
-      }
-      const event = JSON.parse(rawBody);
-      const outcome = await processVerifiedStripeWebhookEvent(event);
-      return NextResponse.json({
-        ok: outcome.ok,
-        webhookVerified: true,
-        entitlementGranted: outcome.entitlementGranted,
-      });
-    }
-
-    // Mode 2: Authenticated Checkout -> Generates server-signed webhook event & verifies it
     const user = await getAuthenticatedUser(req);
-    const body = JSON.parse(rawBody);
-    const {
-      action,
-      plan,
-      exportTier,
-      taxYear = 2025,
-    } = body as {
-      action: 'subscribe_pro' | 'downgrade_free_trial' | 'purchase_export_package';
-      plan?: 'free_trial' | 'pro_monthly';
-      exportTier?: 'essential_50' | 'professional_100' | 'complete_audit_200';
-      taxYear?: TaxYear;
+    const body = JSON.parse(rawBody || '{}') as {
+      action?: 'subscribe_pro' | 'purchase_export_package' | 'cancel_subscription';
+      exportTier?: ExportPurchaseRecord['tier'];
+      taxYear?: number;
     };
+    const taxYear = body.taxYear === 2026 ? 2026 : 2025;
+    if (!isStripeConfigured()) throw new PaymentsNotConfiguredError();
 
-    const eventPayload =
-      action === 'purchase_export_package'
-        ? {
-            id: `evt_${Date.now()}`,
-            type: 'payment_intent.succeeded' as const,
-            data: {
-              userId: user.id,
-              taxYear,
-              exportTier: exportTier || 'professional_100',
-              amountCents:
-                exportTier === 'essential_50'
-                  ? 5000
-                  : exportTier === 'complete_audit_200'
-                  ? 20000
-                  : 10000,
-              stripeReferenceId: `pi_verified_${Date.now()}`,
-            },
-          }
-        : {
-            id: `evt_${Date.now()}`,
-            type: 'customer.subscription.updated' as const,
-            data: {
-              userId: user.id,
-              plan:
-                action === 'downgrade_free_trial'
-                  ? ('free_trial' as const)
-                  : plan || ('pro_monthly' as const),
-              amountCents: action === 'downgrade_free_trial' ? 0 : 1000,
-              stripeReferenceId: `sub_verified_${Date.now()}`,
-            },
-          };
-
-    const payloadStr = JSON.stringify(eventPayload);
-    const signature = signStripeWebhookPayload(payloadStr);
-    const check = verifyStripeWebhookSignature(payloadStr, signature);
-
-    if (!check.verified) {
-      return NextResponse.json(
-        { ok: false, error: 'Server webhook signature check failed' },
-        { status: 400 }
+    if (body.action === 'cancel_subscription') {
+      const db = await getDb();
+      const sub = await db.query<{ stripe_subscription_id: string | null }>(
+        `SELECT stripe_subscription_id FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [user.id]
       );
+      const id = sub.rows[0]?.stripe_subscription_id;
+      if (!id) throw new Error('No active subscription to cancel');
+      await cancelSubscriptionAtPeriodEnd(id);
+      return NextResponse.json({ ok: true, message: 'Subscription will end at the close of the current period.' });
     }
 
-    const result = await processVerifiedStripeWebhookEvent(eventPayload);
-    const activeYear: TaxYear = taxYear === 2026 ? 2026 : 2025;
-    const updatedState = await getFullWorkspaceState(user.id, activeYear);
-
-    return NextResponse.json({
-      ok: true,
-      webhookVerified: true,
-      entitlementGranted: result.entitlementGranted,
-      data: updatedState,
+    const origin = req.headers.get('origin') || req.nextUrl.origin;
+    const checkoutUrl = await createCheckoutSession({
+      user,
+      kind: body.action === 'purchase_export_package' ? 'export' : 'subscription',
+      tier: body.exportTier,
+      taxYear,
+      origin,
     });
+    return NextResponse.json({ ok: true, checkoutUrl });
   } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Payment error' },
-      { status: 400 }
-    );
+    if (err instanceof PaymentsNotConfiguredError) return errorResponse(err, 503);
+    return errorResponse(err);
   }
 }

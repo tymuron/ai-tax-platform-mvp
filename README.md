@@ -4,21 +4,22 @@ AI Tax is an analytical online platform for US individuals and self-employed sol
 
 ## Core Principles
 1. **Real Financial Effect over Raw Deductions**: Clearly distinguishes between a **Tax Deduction**, a **Tax Credit**, **Tax Liability**, and **Real Tax Savings** (e.g., \$10,000 in business expenses does not equal \$10,000 in tax savings).
-2. **Evidence & Traceability First**: Every transaction and recommendation carries a 6-level Evidence Classification (`Verified by Document`, `Potentially Deductible — Confirmation Required`, `Partially Deductible`, `Non-Deductible`, `Additional Information Required`, `Insufficient Data`), source coordinates, and IRS citations.
+2. **Evidence & Traceability First**: A merchant name is never treated as proof. Every transaction and recommendation carries a 6-level Evidence Classification (`Verified by Document`, `Potentially Deductible — Confirmation Required`, `Partially Deductible`, `Non-Deductible`, `Additional Information Required`, `Insufficient Data`), source coordinates, and IRS citations.
 3. **Zero Double Counting**: Automatically excludes inter-account transfers (`transfer_between_own_accounts`), credit card bill repayments (`credit_card_repayment`), and duplicate statement rows.
-4. **Deterministic Tax Calculation Engine**: Pure, reproducible mathematical engine versioned by tax year (`IRS-2025.2` and `IRS-2026.1`), never free-form LLM text generation.
+4. **Deterministic Tax Calculation Engine**: reproducible federal engine versioned by tax year (`IRS-2025.3` with OBBBA changes, `IRS-2026.2` from Rev. Proc. 2025-32). State tax is not calculated and never estimated with an invented rate.
+
+> Status: see `AUDIT_2026-11-08.md`. Before real customers: set `DATABASE_URL`, secrets, Stripe keys (ENVIRONMENT.md), and complete the legal review in spec §15.
 
 ## Quick Start
 
 ```bash
-cd /Users/tymurchystiakov/antigravity-workspace/playground/ai-tax
 npm install
 npm test
 npm run build
 npm run dev
 ```
 
-Open `http://localhost:3000` to access the full 8-tab workspace.
+Open `http://localhost:3000`, create an account or click **Try a demo**. For the admin console set `ADMIN_EMAIL` and `ADMIN_PASSWORD` first.
 
 ## Engineering Documentation Index
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — System architecture, modular engines, and data flows

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthenticatedUser } from '@/lib/security/vault-and-auth';
+import { errorResponse, getAuthenticatedUser } from '@/lib/security/vault-and-auth';
 import { getDb, writeAuditLog } from '@/lib/db';
 import {
   getFullWorkspaceState,
@@ -36,6 +36,13 @@ export async function PATCH(req: NextRequest) {
       taxYear?: TaxYear;
     };
 
+    if (
+      (businessUsePct !== undefined && (typeof businessUsePct !== 'number' || businessUsePct < 0 || businessUsePct > 100)) ||
+      (confirmedAmount !== undefined && (typeof confirmedAmount !== 'number' || !(confirmedAmount > 0))) ||
+      (confirmedDate !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(String(confirmedDate)))
+    ) {
+      return NextResponse.json({ ok: false, error: 'Invalid business use %, amount or date' }, { status: 400 });
+    }
     if (!transactionId) {
       return NextResponse.json({ ok: false, error: 'Missing transactionId' }, { status: 400 });
     }
@@ -110,9 +117,6 @@ export async function PATCH(req: NextRequest) {
 
     return NextResponse.json({ ok: true, data: updatedState });
   } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Update failed' },
-      { status: 400 }
-    );
+    return errorResponse(err, 400);
   }
 }

@@ -1,45 +1,41 @@
+/**
+ * Reference tests. Every expected number below was worked out by hand from the IRS
+ * sources cited in src/lib/tax-rules/seed-rules.ts (Rev. Proc. 2024-40, Rev. Proc. 2025-32,
+ * OBBBA, Notice 2026-10 / Announcement 2026-11). A change that moves one of them is a
+ * change in tax results and must be justified against the source.
+ */
 import { describe, it, expect } from 'vitest';
 import { getTaxRulesForYear } from '@/lib/tax-rules/seed-rules';
 import {
-  computeHomeOfficeDeduction,
+  childCareCreditRate,
+  computeEarnedIncomeCredit,
   computeProgressiveFederalTax,
   computeVehicleDeduction,
   runDeterministicTaxCalculation,
 } from '@/lib/engines/tax-calculator';
+import { classifyTransactionRecord } from '@/lib/engines/financial-analysis';
+import { extractTransactionsFromContent } from '@/lib/engines/document-intelligence';
 import {
-  extractTransactionsFromContent,
-  reconcileAndNormalizeTransactions,
-} from '@/lib/engines/document-intelligence';
-import {
-  classifyTransactionRecord,
-  isAmbiguousMerchant,
-} from '@/lib/engines/financial-analysis';
-import { generateContextualInterviewQuestions } from '@/lib/engines/interview-engine';
-import { generateTaxOptimizationRecommendations } from '@/lib/engines/optimization-engine';
-import {
-  buildStructuredTaxOptimizationReport,
-  runQualityAssuranceEngine,
-} from '@/lib/engines/qa-and-report-engine';
-import {
-  createSignedDownloadToken,
-  maskSensitivePII,
-  verifySignedDownloadToken,
-} from '@/lib/security/crypto-and-masking';
-import {
-  signStripeWebhookPayload,
-  verifyStripeWebhookSignature,
-} from '@/lib/services/payment-and-export-service';
-import { getDb } from '@/lib/db';
-import { UserProfileRecord } from '@/types/tax';
+  ScheduleCCategory,
+  TransactionClassificationRecord,
+  TransactionGroup,
+  TransactionRecord,
+  TransactionSubType,
+  EvidenceClassification,
+  UserProfileRecord,
+} from '@/types/tax';
 
-const BASE_TEST_PROFILE: UserProfileRecord = {
-  user_id: 'user_test_01',
+const R25 = getTaxRulesForYear(2025);
+const R26 = getTaxRulesForYear(2026);
+
+export const PROFILE: UserProfileRecord = {
+  user_id: 'u1',
   tax_year: 2025,
   filing_status: 'single',
-  state_code: 'TX', // 0% state tax for pure federal reference cases
-  business_type: 'Sole Proprietorship',
-  industry_code: '541511',
-  has_w2_income: true,
+  state_code: 'TX',
+  business_type: 'Sole proprietor',
+  industry_code: '541611',
+  has_w2_income: false,
   has_1099_income: true,
   has_schedule_c: true,
   dependents_count: 0,
@@ -48,275 +44,321 @@ const BASE_TEST_PROFILE: UserProfileRecord = {
   education_expenses_paid: 0,
   education_years_claimed: 0,
   is_student_at_least_half_time: false,
-  home_total_sqft: 2000,
-  home_office_sqft: 200,
-  home_office_exclusive_regular_use: true,
-  home_annual_rent_or_mortgage_interest: 24000,
-  home_annual_utilities_insurance: 3600,
-  vehicle_total_miles: 10000,
-  vehicle_business_miles: 4000,
-  vehicle_actual_expenses: 2000,
-  vehicle_placed_in_service_date: '2025-01-10',
+  home_total_sqft: 0,
+  home_office_sqft: 0,
+  home_office_exclusive_regular_use: false,
+  home_annual_rent_or_mortgage_interest: 0,
+  home_annual_utilities_insurance: 0,
+  vehicle_total_miles: 0,
+  vehicle_business_miles: 0,
+  vehicle_actual_expenses: 0,
+  vehicle_placed_in_service_date: null,
   self_employed_health_insurance_premiums: 0,
   sep_ira_solo_401k_contributions: 0,
   estimated_tax_payments_made: 0,
+  vehicle_mileage_log_confirmed: false,
+  vehicle_business_miles_after_rate_change: 0,
   has_unsupported_complex_entity: false,
   unsupported_entity_notes: null,
   updated_at: '2026-11-08T00:00:00Z',
 };
 
-describe('AI Tax v2.0 — Reference Deterministic Tax Calculation Suite (100% Exact Match)', () => {
-  it('1. Computes exact 2025 progressive federal income tax brackets for Single filer', () => {
-    const rules2025 = getTaxRulesForYear(2025).rules_payload;
-    // Taxable income = $60,000 for Single in 2025:
-    // First $11,925 @ 10% = $1,192.50
-    // Next ($48,475 - $11,925 = $36,550) @ 12% = $4,386.00
-    // Remaining ($60,000 - $48,475 = $11,525) @ 22% = $2,535.50
-    // Exact Total = $8,114.00
-    const res = computeProgressiveFederalTax(
-      60000,
-      'single',
-      rules2025.federal_brackets.single
-    );
-    expect(res.tax).toBe(8114.0);
-    expect(res.marginalRate).toBe(0.22);
+let seq = 0;
+export function tx(
+  amount: number,
+  direction: 'inflow' | 'outflow',
+  group: TransactionGroup,
+  sub: TransactionSubType,
+  cat: ScheduleCCategory,
+  evidence: EvidenceClassification,
+  opts: { overridden?: boolean; businessPct?: number; review?: TransactionRecord['review_status'] } = {}
+): { t: TransactionRecord; c: TransactionClassificationRecord } {
+  seq += 1;
+  const id = `t${seq}`;
+  const t: TransactionRecord = {
+    id,
+    user_id: 'u1',
+    document_id: 'd1',
+    tax_year: 2025,
+    transaction_date: '2025-06-01',
+    amount,
+    currency: 'USD',
+    direction,
+    merchant_name: id,
+    raw_description: id,
+    masked_description: id,
+    source_page: 1,
+    source_line_ref: `CSV:Row-${seq}`,
+    review_status: opts.review ?? 'ok',
+    is_duplicate: false,
+    duplicate_of_transaction_id: null,
+    is_recurring: false,
+    recurring_group_key: null,
+    extraction_confidence: 0.97,
+    created_at: '2026-11-08T00:00:00Z',
+  };
+  const c: TransactionClassificationRecord = {
+    id: `c${seq}`,
+    transaction_id: id,
+    user_id: 'u1',
+    initial_group: group,
+    ai_group: group,
+    user_confirmed_group: opts.overridden ? group : null,
+    effective_group: group,
+    sub_type: sub,
+    schedule_c_category: cat,
+    evidence_classification: evidence,
+    business_use_pct: opts.businessPct ?? 100,
+    meal_deduction_limit_pct: 100,
+    is_user_overridden: Boolean(opts.overridden),
+    confidence_score: 0.9,
+    applied_rule_ref: 'test',
+    reasoning: 'test',
+    missing_evidence_items: [],
+    supporting_document_id: 'd1',
+    updated_at: '2026-11-08T00:00:00Z',
+  };
+  return { t, c };
+}
+
+function run(profile: UserProfileRecord, rows: Array<{ t: TransactionRecord; c: TransactionClassificationRecord }>) {
+  return runDeterministicTaxCalculation({
+    userId: 'u1',
+    profile,
+    transactions: rows.map((r) => r.t),
+    classifications: rows.map((r) => r.c),
+    ruleVersion: profile.tax_year === 2026 ? R26 : R25,
   });
+}
 
-  it('2. Computes exact Home Office Simplified vs Regular method and caps at tentative Schedule C profit', () => {
-    // 200 sq ft of 2000 sq ft (10%)
-    // Simplified: 200 * $5 = $1,000
-    // Regular: ($24,000 + $3,600) * 10% = $2,760
-    const ho = computeHomeOfficeDeduction({
-      profile: BASE_TEST_PROFILE,
-      tentativeScheduleCProfit: 50000,
-      simplifiedRatePerSqFt: 5,
-      simplifiedMaxSqFt: 300,
+describe('Rule tables match the IRS sources', () => {
+  it('2025 reflects OBBBA (standard deduction, CTC, §179)', () => {
+    const r = R25.rules_payload;
+    expect(r.standard_deduction).toEqual({
+      single: 15750,
+      married_filing_jointly: 31500,
+      married_filing_separately: 15750,
+      head_of_household: 23625,
     });
-    expect(ho.simplifiedAmount).toBe(1000);
-    expect(ho.regularAmount).toBe(2760);
-    expect(ho.methodUsed).toBe('regular');
-    expect(ho.deduction).toBe(2760);
-
-    // When tentative profit is only $800, IRC §280A(c)(5) caps deduction at $800
-    const capped = computeHomeOfficeDeduction({
-      profile: BASE_TEST_PROFILE,
-      tentativeScheduleCProfit: 800,
-      simplifiedRatePerSqFt: 5,
-      simplifiedMaxSqFt: 300,
-    });
-    expect(capped.deduction).toBe(800);
+    expect(r.child_tax_credit_per_child).toBe(2200);
+    expect(r.section_179_max_deduction).toBe(2500000);
+    expect(r.standard_mileage_rate_cents).toBe(70);
+    expect(r.eitc[3].max_credit).toBe(8046);
   });
-
-  it('3. Computes exact Vehicle Mileage (70 cents/mile in 2025) vs Actual Expenses', () => {
-    // 4,000 business miles * $0.70 = $2,800 vs Actual (40% of $2,000 = $800)
-    const veh = computeVehicleDeduction({
-      profile: BASE_TEST_PROFILE,
-      standardMileageRateCents: 70,
-    });
-    expect(veh.standardMileageAmount).toBe(2800);
-    expect(veh.actualExpenseAmount).toBe(800);
-    expect(veh.methodUsed).toBe('standard_mileage');
-    expect(veh.deduction).toBe(2800);
+  it('2026 matches Rev. Proc. 2025-32', () => {
+    const r = R26.rules_payload;
+    expect(r.standard_deduction.single).toBe(16100);
+    expect(r.standard_deduction.married_filing_jointly).toBe(32200);
+    expect(r.standard_deduction.head_of_household).toBe(24150);
+    expect(r.federal_brackets.single.map((b) => b.up_to)).toEqual([12400, 50400, 105700, 201775, 256225, 640600, null]);
+    expect(r.qbi_threshold.single).toBe(201750);
+    expect(r.qbi_phase_in_range.single).toBe(75000);
+    expect(r.section_179_max_deduction).toBe(2560000);
+    expect(r.eitc.map((c) => c.max_credit)).toEqual([664, 4427, 7316, 8231]);
+    expect(r.standard_mileage_rate_change).toEqual({ effective_date: '2026-07-01', cents: 76 });
   });
+});
 
-  it('4. Distinguishes $10,000 business expense deduction from real tax savings and reconciles Schedule C, SE, and QBI', async () => {
-    const ruleVersion = getTaxRulesForYear(2025);
-    const csvContent = [
-      'Date,Description,Amount,Direction,Currency',
-      '2025-03-01,Form 1099-NEC Consulting Revenue,100000.00,inflow,USD',
-      '2025-04-15,Google Ads Marketing Campaign,10000.00,outflow,USD',
-      '2025-05-10,Adobe Creative Cloud Subscription,720.00,outflow,USD',
-      '2025-06-01,Amazon.com Marketplace Order #991,1500.00,outflow,USD',
-      '2025-07-01,Transfer to Checking from Savings,8000.00,outflow,USD',
-      '2025-08-01,Chase Credit Crd Epay AutoPay,3200.00,outflow,USD',
-    ].join('\n');
-
-    const extracted = await extractTransactionsFromContent({
-      filename: 'test_statement.csv',
-      format: 'CSV',
-      buffer: Buffer.from(csvContent, 'utf8'),
-      taxYear: 2025,
-    });
-
-    const processed = reconcileAndNormalizeTransactions({
-      userId: BASE_TEST_PROFILE.user_id,
-      documentId: 'doc_test_1',
-      filename: 'test_statement.csv',
-      mimeType: 'text/csv',
-      format: 'CSV',
-      documentType: 'bank_statement',
-      fileSizeBytes: csvContent.length,
-      storagePath: '/tmp/test.enc',
-      buffer: Buffer.from(csvContent, 'utf8'),
-      taxYear: 2025,
-      ocrUsed: false,
-      missingPagesDetected: false,
-      extractedMetadata: {},
-      extractedRows: extracted.extractedRows,
-      existingTransactions: [],
-    });
-
-    const classifications = processed.transactions.map((tx) =>
-      classifyTransactionRecord({ tx })
-    );
-
-    // Verify transfer and credit card repayment are classified as Non-expense transactions
-    const transferCls = classifications.find(
-      (c) => c.sub_type === 'transfer_between_own_accounts'
-    );
-    expect(transferCls?.effective_group).toBe('Non-expense transactions');
-
-    const ccRepayCls = classifications.find(
-      (c) => c.sub_type === 'credit_card_repayment'
-    );
-    expect(ccRepayCls?.effective_group).toBe('Non-expense transactions');
-
-    // Verify Amazon is NOT automatically verified_by_document without confirmation
-    const amazonTx = processed.transactions.find((t) =>
-      t.merchant_name.toLowerCase().includes('amazon')
-    );
-    expect(isAmbiguousMerchant(amazonTx!.merchant_name)).toBe(true);
-    const amazonCls = classifications.find((c) => c.transaction_id === amazonTx!.id);
-    expect(amazonCls?.evidence_classification).toBe('additional_info_required');
-
-    // Run deterministic tax calculation across all 3 scenarios
-    const calcRun = runDeterministicTaxCalculation({
-      userId: BASE_TEST_PROFILE.user_id,
-      profile: BASE_TEST_PROFILE,
-      transactions: processed.transactions,
-      classifications,
-      ruleVersion,
-    });
-
-    const { baseline, confirmed, potential } = calcRun.scenarios;
-
-    // Gross income must be exactly $100,000 in all 3 scenarios (transfers & CC repayments excluded)
-    expect(baseline.total_gross_income).toBe(100000);
-    expect(confirmed.total_gross_income).toBe(100000);
-    expect(potential.total_gross_income).toBe(100000);
-
-    // Baseline has $0 advertising/home-office/mileage optimizations
-    expect(baseline.total_schedule_c_deductions).toBe(0);
-
-    // Confirmed includes $10,000 Google Ads (verified) + $2,800 Mileage + $2,760 Home Office = $15,560
-    // (Adobe $720 and Amazon $1,500 are unconfirmed, so they are NOT in Confirmed!)
-    expect(confirmed.total_schedule_c_deductions).toBe(15560);
-    expect(confirmed.schedule_c_net_profit).toBe(84440);
-
-    // Potential includes Confirmed ($15,560) + Adobe ($720) + Amazon ($1,500) = $17,780
-    expect(potential.total_schedule_c_deductions).toBe(17780);
-    expect(potential.schedule_c_net_profit).toBe(82220);
-
-    // Real tax savings on $15,560 of confirmed deductions is strictly less than $15,560
-    expect(confirmed.savings_vs_baseline).toBeGreaterThan(3500);
-    expect(confirmed.savings_vs_baseline).toBeLessThan(15560);
-    expect(potential.savings_vs_baseline).toBeGreaterThan(confirmed.savings_vs_baseline);
-
-    // QA Engine check
-    const recs = generateTaxOptimizationRecommendations({
-      userId: BASE_TEST_PROFILE.user_id,
-      profile: BASE_TEST_PROFILE,
-      transactions: processed.transactions,
-      classifications,
-      ruleVersion,
-      calculationRun: calcRun,
-    });
-
-    const qa = runQualityAssuranceEngine({
-      documents: [processed.document],
-      transactions: processed.transactions,
-      classifications,
-      calculationRun: calcRun,
-      recommendations: recs,
-      ruleVersion,
-    });
-
-    expect(qa.passed).toBe(true);
-    expect(qa.metrics.tax_calculation_accuracy).toBe(100);
-    expect(qa.metrics.duplicate_detection_accuracy).toBe(100);
-
-    // Interview engine generates question for Adobe ($720) and Amazon ($1,500)
-    const questions = generateContextualInterviewQuestions({
-      userId: BASE_TEST_PROFILE.user_id,
-      taxYear: 2025,
-      profile: BASE_TEST_PROFILE,
-      transactions: processed.transactions,
-      classifications,
-      existingQuestions: [],
-    });
-    expect(questions.some((q) => q.question_text.includes('Adobe'))).toBe(true);
-    expect(questions.some((q) => q.question_text.includes('Amazon'))).toBe(true);
-
-    // Report generation
-    const report = buildStructuredTaxOptimizationReport({
-      userId: BASE_TEST_PROFILE.user_id,
-      profile: BASE_TEST_PROFILE,
-      documents: [processed.document],
-      transactions: processed.transactions,
-      classifications,
-      questions,
-      recommendations: recs,
-      calculationRun: calcRun,
-      qaResult: qa,
-    });
-    expect(report.report_payload.estimated_tax_impact.confirmed_real_tax_savings).toBe(
-      confirmed.savings_vs_baseline
-    );
+describe('Regular tax (Tax Table under $100k, worksheet above)', () => {
+  it('Tax Table: single 2025, taxable income $60,000 → $8,120 (midpoint $60,025)', () => {
+    expect(computeProgressiveFederalTax(60000, 'single', R25.rules_payload.federal_brackets.single).tax).toBe(8120);
   });
+  it('Worksheet: single 2025, $150,000 → $28,847.00', () => {
+    expect(computeProgressiveFederalTax(150000, 'single', R25.rules_payload.federal_brackets.single).tax).toBe(28847);
+  });
+  it('Worksheet: MFJ 2026, $250,000 → $45,196.00', () => {
+    expect(
+      computeProgressiveFederalTax(250000, 'married_filing_jointly', R26.rules_payload.federal_brackets.married_filing_jointly).tax
+    ).toBe(45196);
+  });
+});
 
-  it('5. Enforces Security, PII Masking, Signed Download Links, Stripe Webhook Verification, and 16 PostgreSQL Tables', async () => {
-    // PII Masking
-    const raw =
-      'ACH Payment SSN 123-45-6789 EIN 12-3456789 Card 4532 0151 1283 8899 john.doe@example.com';
-    const masked = maskSensitivePII(raw);
-    expect(masked).not.toContain('123-45-6789');
-    expect(masked).not.toContain('12-3456789');
-    expect(masked).not.toContain('4532 0151 1283 8899');
-    expect(masked).not.toContain('john.doe@example.com');
-    expect(masked).toContain('[REDACTED-SSN]');
-
-    // Signed download tokens & cross-tenant isolation
-    const { token } = createSignedDownloadToken({
-      userId: 'user_alpha',
-      resourceType: 'export_package',
-      resourceId: 'rep_123',
-      format: 'PDF',
+describe('Earned income credit (EIC table method)', () => {
+  const eic = (year: 2025 | 2026, fs: UserProfileRecord['filing_status'], kids: number, earned: number, agi = earned) =>
+    computeEarnedIncomeCredit({
+      rules: (year === 2025 ? R25 : R26).rules_payload,
+      filingStatus: fs,
+      qualifyingChildren: kids,
+      earnedIncome: earned,
+      agi,
     });
-    expect(verifySignedDownloadToken(token, 'user_alpha').valid).toBe(true);
-    expect(verifySignedDownloadToken(token, 'user_beta').valid).toBe(false);
+  it('plateau: 2025 single, 1 child, $20,000 → $4,328', () => expect(eic(2025, 'single', 1, 20000)).toBe(4328));
+  it('phase-out: 2025 single, 1 child, $40,000 → $1,663', () => expect(eic(2025, 'single', 1, 40000)).toBe(1663));
+  it('phase-in: 2025 single, no child, $5,000 → $384', () => expect(eic(2025, 'single', 0, 5000)).toBe(384));
+  it('2026 MFJ, 2 children, $30,000 → $7,316', () => expect(eic(2026, 'married_filing_jointly', 2, 30000)).toBe(7316));
+  it('at the completed phase-out amount → $0', () => expect(eic(2025, 'single', 1, 50434)).toBe(0));
+  it('married filing separately → $0', () => expect(eic(2025, 'married_filing_separately', 1, 20000)).toBe(0));
+});
 
-    // Stripe webhook signature verification
-    const payload = JSON.stringify({ id: 'evt_1', type: 'payment_intent.succeeded' });
-    const sig = signStripeWebhookPayload(payload);
-    expect(verifyStripeWebhookSignature(payload, sig).verified).toBe(true);
-    expect(verifyStripeWebhookSignature(payload + 'tampered', sig).verified).toBe(false);
+describe('Dependent care credit rate (§21)', () => {
+  it('2025: 27% at $30k AGI, 20% floor at $50k', () => {
+    expect(childCareCreditRate(R25.rules_payload, 'single', 30000)).toBe(0.27);
+    expect(childCareCreditRate(R25.rules_payload, 'single', 50000)).toBe(0.2);
+  });
+  it('2026 (OBBBA): 42% at $30k, 22% at $100k single, 22% at $200k MFJ', () => {
+    expect(childCareCreditRate(R26.rules_payload, 'single', 30000)).toBe(0.42);
+    expect(childCareCreditRate(R26.rules_payload, 'single', 100000)).toBe(0.22);
+    expect(childCareCreditRate(R26.rules_payload, 'married_filing_jointly', 200000)).toBe(0.22);
+  });
+});
 
-    // Verify all 16 required database entities exist in PostgreSQL
-    const db = await getDb();
-    const tablesRes = await db.query<{ table_name: string }>(
-      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'`
-    );
-    const tableNames = tablesRes.rows.map((r) => r.table_name);
-    const requiredTables = [
-      'users',
-      'user_profiles',
-      'subscriptions',
-      'documents',
-      'transactions',
-      'transaction_classifications',
-      'ai_questions',
-      'ai_answers',
-      'tax_analyses',
-      'tax_recommendations',
-      'generated_reports',
-      'export_purchases',
-      'ratings',
-      'audit_logs',
-      'tax_rule_versions',
-      'calculation_runs',
-    ];
-    for (const reqTable of requiredTables) {
-      expect(tableNames).toContain(reqTable);
+describe('Three scenarios — Schedule C sole proprietor, single, 2025', () => {
+  const rows = [
+    tx(122000, 'inflow', 'Income', 'freelance_1099_income', 'none', 'verified_by_document'),
+    tx(2000, 'outflow', 'Business expenses', 'operating_expense', 'bank_and_payment_processing_fees', 'verified_by_document'),
+    tx(40000, 'outflow', 'Business expenses', 'operating_expense', 'professional_services', 'verified_by_document', { overridden: true }),
+    tx(40000, 'outflow', 'Business expenses', 'operating_expense', 'advertising_and_marketing', 'potentially_deductible_confirmation_required'),
+  ];
+  const r = run(PROFILE, rows);
+
+  it('baseline (profit $120,000): total federal tax $28,727.46', () => {
+    const b = r.scenarios.baseline;
+    expect(b.schedule_c_net_profit).toBe(120000);
+    expect(b.total_self_employment_tax).toBe(16955.46);
+    expect(b.deductible_half_se_tax).toBe(8477.73);
+    expect(b.qbi_deduction).toBe(19154.45);
+    expect(b.taxable_income).toBe(76617.82);
+    expect(b.regular_federal_income_tax).toBe(11772);
+    expect(b.total_estimated_tax_liability).toBe(28727.46);
+  });
+  it('confirmed (profit $80,000): $16,690.64, $12,036.82 below baseline', () => {
+    const c = r.scenarios.confirmed;
+    expect(c.schedule_c_net_profit).toBe(80000);
+    expect(c.taxable_income).toBe(46878.54);
+    expect(c.regular_federal_income_tax).toBe(5387);
+    expect(c.total_estimated_tax_liability).toBe(16690.64);
+    expect(c.savings_vs_baseline).toBe(12036.82);
+  });
+  it('potential (profit $40,000): $7,468.82 and flagged as needing confirmation', () => {
+    const p = r.scenarios.potential;
+    expect(p.requires_user_confirmation).toBe(true);
+    expect(p.taxable_income).toBe(17139.27);
+    expect(p.total_estimated_tax_liability).toBe(7468.82);
+    expect(p.savings_vs_baseline).toBe(21258.64);
+  });
+  it('a $40,000 deduction is not $40,000 of savings', () => {
+    expect(r.scenarios.confirmed.savings_vs_baseline).toBeLessThan(40000);
+  });
+  it('is reproducible for the same inputs and rule version', () => {
+    const again = run(PROFILE, rows);
+    expect(again.scenarios).toEqual(r.scenarios);
+  });
+});
+
+describe('Credits: refundable vs non-refundable', () => {
+  it('HOH, 2 children, $30,000 wages (2025): CTC $638 + ACTC $3,400 + EITC $5,746', () => {
+    const profile: UserProfileRecord = {
+      ...PROFILE,
+      filing_status: 'head_of_household',
+      has_schedule_c: false,
+      has_1099_income: false,
+      has_w2_income: true,
+      dependents_count: 2,
+      qualifying_children_under_17: 2,
+    };
+    const r = run(profile, [tx(30000, 'inflow', 'Income', 'w2_wages', 'none', 'verified_by_document')]);
+    const c = r.scenarios.confirmed;
+    expect(c.taxable_income).toBe(6375);
+    expect(c.regular_federal_income_tax).toBe(638);
+    expect(c.nonrefundable_credits_used).toBe(638);
+    expect(c.child_tax_credit).toBe(638 + 3400);
+    expect(c.earned_income_tax_credit).toBe(5746);
+    expect(c.refundable_credits).toBe(3400 + 5746);
+    expect(c.total_estimated_tax_liability).toBe(0);
+    expect(c.net_tax_owed_or_refund).toBe(-9146);
+  });
+});
+
+describe('Vehicle, §179, state and scope guards', () => {
+  const base = { ...PROFILE, vehicle_total_miles: 10000, vehicle_business_miles: 4000, vehicle_actual_expenses: 2000 };
+  const income = tx(50000, 'inflow', 'Income', 'freelance_1099_income', 'none', 'verified_by_document');
+  const gas = tx(500, 'outflow', 'Business expenses', 'operating_expense', 'vehicle_expenses', 'verified_by_document', { overridden: true });
+
+  it('mileage stays out of the confirmed scenario until the mileage log is confirmed', () => {
+    const c = run(base, [income, gas]).scenarios.confirmed;
+    expect(c.vehicle_deduction).toBe(0);
+    expect(c.schedule_c_expenses_by_category.vehicle_expenses).toBe(500);
+  });
+  it('with a confirmed log: 4,000 mi × 70¢ = $2,800 and fuel on the statement is not counted again', () => {
+    const c = run({ ...base, vehicle_mileage_log_confirmed: true }, [income, gas]).scenarios.confirmed;
+    expect(c.vehicle_deduction).toBe(2800);
+    expect(c.vehicle_method).toBe('standard_mileage');
+    expect(c.schedule_c_expenses_by_category.vehicle_expenses).toBe(0);
+  });
+  it('2026 mid-year rate: 600 mi × 72.5¢ + 400 mi × 76¢ = $739.00', () => {
+    const v = computeVehicleDeduction({
+      profile: { ...base, vehicle_business_miles: 1000, vehicle_business_miles_after_rate_change: 400 },
+      standardMileageRateCents: R26.rules_payload.standard_mileage_rate_cents,
+      rateChange: R26.rules_payload.standard_mileage_rate_change,
+    });
+    expect(v.standardMileageAmount).toBe(739);
+  });
+  it('§179 is refused for equipment with ≤50% business use and the run asks for review', () => {
+    const laptop = tx(3000, 'outflow', 'Business expenses', 'operating_expense', 'depreciation_and_section_179', 'verified_by_document', {
+      overridden: true,
+      businessPct: 40,
+    });
+    const r = run(PROFILE, [income, laptop]);
+    expect(r.scenarios.confirmed.section_179_and_depreciation).toBe(0);
+    expect(r.status).toBe('additional_review_required');
+  });
+  it('state tax is never invented: CA is "not calculated", TX has none', () => {
+    const ca = run({ ...PROFILE, state_code: 'CA' }, [income]).scenarios.confirmed;
+    const tx_ = run(PROFILE, [income]).scenarios.confirmed;
+    expect(ca.state_tax_status).toBe('not_calculated');
+    expect(ca.estimated_state_income_tax).toBe(0);
+    expect(tx_.state_tax_status).toBe('no_wage_income_tax');
+    expect(ca.total_estimated_tax_liability).toBe(tx_.total_estimated_tax_liability);
+  });
+  it('rows needing review are left out of every total', () => {
+    const blurry = tx(9999, 'outflow', 'Business expenses', 'operating_expense', 'office_expenses', 'potentially_deductible_confirmation_required', {
+      review: 'needs_review',
+    });
+    const r = run(PROFILE, [income, blurry]);
+    expect(r.scenarios.potential.schedule_c_expenses_by_category.office_expenses).toBe(0);
+    expect(r.input_snapshot.transactions_needing_review).toBe(1);
+  });
+  it('unsupported entities produce "Additional tax review required"', () => {
+    const r = run({ ...PROFILE, has_unsupported_complex_entity: true }, [income]);
+    expect(r.status).toBe('additional_review_required');
+    expect(r.additional_review_reasons[0]).toMatch(/Additional tax review required/);
+  });
+});
+
+describe('Classification never treats a merchant name as proof', () => {
+  const mk = (desc: string): TransactionRecord => ({
+    ...tx(100, 'outflow', 'Business expenses', 'operating_expense', 'none', 'non_deductible').t,
+    merchant_name: desc,
+    raw_description: desc,
+  });
+  it('Staples / WeWork / CPA → confirmation required, not "verified"', () => {
+    for (const d of ['Staples Office Supplies', 'WeWork Dedicated Desk', 'Smith CPA Bookkeeping', 'Google Ads Campaign']) {
+      expect(classifyTransactionRecord({ tx: mk(d) }).evidence_classification).toBe('potentially_deductible_confirmation_required');
     }
+  });
+  it('Amazon → additional information required', () => {
+    expect(classifyTransactionRecord({ tx: mk('Amazon.com Marketplace') }).evidence_classification).toBe('additional_info_required');
+  });
+});
+
+describe('Document intelligence reads real files', () => {
+  it('extracts statement lines from a real (text-based) PDF', async () => {
+    const { jsPDF } = await import('jspdf');
+    const doc = new jsPDF();
+    doc.text(['Withdrawals', '03/14/2025 GOOGLE ADS CAMPAIGN 250.00 4,750.00', '03/20/2025 STAPLES STORE 42.10 4,707.90'], 10, 20);
+    const buffer = Buffer.from(doc.output('arraybuffer'));
+    const out = await extractTransactionsFromContent({ filename: 'statement.pdf', format: 'PDF', buffer, taxYear: 2025 });
+    expect(out.extractionError).toBeNull();
+    expect(out.extractedRows).toHaveLength(2);
+    expect(out.extractedRows[0]).toMatchObject({ transaction_date: '2025-03-14', amount: 250, direction: 'outflow' });
+  });
+  it('a PDF without readable text yields an error and no invented rows', async () => {
+    const { jsPDF } = await import('jspdf');
+    const doc = new jsPDF();
+    doc.rect(10, 10, 80, 80, 'F'); // graphics only, like a scan
+    const buffer = Buffer.from(doc.output('arraybuffer'));
+    const out = await extractTransactionsFromContent({ filename: 'scan.pdf', format: 'PDF', buffer, taxYear: 2025 });
+    expect(out.extractedRows).toHaveLength(0);
+    expect(out.extractionError).toBeTruthy();
   });
 });

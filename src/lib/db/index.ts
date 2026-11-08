@@ -1,8 +1,7 @@
-import { PGlite } from '@electric-sql/pglite';
 import path from 'path';
 import fs from 'fs';
 import { SEEDED_TAX_RULE_VERSIONS } from '@/lib/tax-rules/seed-rules';
-import { hashPassword } from '@/lib/security/crypto-and-masking';
+import { computeSha256, hashPassword } from '@/lib/security/crypto-and-masking';
 
 const DDL_SCHEMA = `
 -- 1. users
@@ -33,7 +32,7 @@ CREATE TABLE IF NOT EXISTS user_profiles (
   education_expenses_paid NUMERIC(12,2) NOT NULL DEFAULT 0,
   education_years_claimed INTEGER NOT NULL DEFAULT 0,
   is_student_at_least_half_time BOOLEAN NOT NULL DEFAULT FALSE,
-  home_total_sqft NUMERIC(10,2) NOT NULL DEFAULT 1500,
+  home_total_sqft NUMERIC(10,2) NOT NULL DEFAULT 0,
   home_office_sqft NUMERIC(10,2) NOT NULL DEFAULT 0,
   home_office_exclusive_regular_use BOOLEAN NOT NULL DEFAULT FALSE,
   home_annual_rent_or_mortgage_interest NUMERIC(12,2) NOT NULL DEFAULT 0,
@@ -274,42 +273,107 @@ CREATE TABLE IF NOT EXISTS calculation_runs (
   formula_trace JSONB NOT NULL,
   created_at TEXT NOT NULL
 );
+-- 17. document_blobs (encrypted original files; AES-256-GCM, never public)
+CREATE TABLE IF NOT EXISTS document_blobs (
+  document_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ciphertext BYTEA NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- 18. stripe_events (webhook idempotency)
+CREATE TABLE IF NOT EXISTS stripe_events (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- Migrations for databases created by earlier versions
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS vehicle_mileage_log_confirmed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS vehicle_business_miles_after_rate_change NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+ALTER TABLE export_purchases ADD COLUMN IF NOT EXISTS stripe_checkout_session_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_transactions_user_year ON transactions(user_id, tax_year);
+CREATE INDEX IF NOT EXISTS idx_documents_user_year ON documents(user_id, tax_year);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
 `;
+
+export interface Db {
+  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
+  exec(sql: string): Promise<unknown>;
+}
+
+export type StorageMode = 'postgres' | 'embedded_persistent' | 'embedded_ephemeral' | 'memory';
 
 declare global {
   // eslint-disable-next-line no-var
-  var __aiTaxPgInstance: PGlite | undefined;
+  var __aiTaxDbInitPromise: Promise<Db> | undefined;
   // eslint-disable-next-line no-var
-  var __aiTaxPgInitPromise: Promise<PGlite> | undefined;
+  var __aiTaxStorageMode: StorageMode | undefined;
 }
 
-export async function getDb(): Promise<PGlite> {
-  if (global.__aiTaxPgInstance) {
-    return global.__aiTaxPgInstance;
-  }
-  if (global.__aiTaxPgInitPromise) {
-    return global.__aiTaxPgInitPromise;
-  }
+/**
+ * How data is stored. "embedded_ephemeral" (Vercel without DATABASE_URL) loses data whenever the
+ * serverless instance is recycled and is not shared between instances — the UI warns about it.
+ */
+export function getStorageMode(): StorageMode {
+  if (process.env.DATABASE_URL) return 'postgres';
+  if (process.env.NODE_ENV === 'test' || process.env.VITEST === 'true') return 'memory';
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) return 'embedded_ephemeral';
+  return 'embedded_persistent';
+}
 
-  global.__aiTaxPgInitPromise = (async () => {
-    const isTest = process.env.NODE_ENV === 'test' || process.env.VITEST === 'true';
-    const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
-    let db: PGlite;
-    if (isTest) {
-      db = new PGlite();
-    } else if (isServerless) {
-      const dataDir = path.join('/tmp', 'ai-tax-pgdata');
-      fs.mkdirSync(dataDir, { recursive: true });
-      db = new PGlite(dataDir);
-    } else {
-      const dataDir = path.join(process.cwd(), '.data', 'pgdata');
-      fs.mkdirSync(dataDir, { recursive: true });
-      db = new PGlite(dataDir);
-    }
+async function openDb(): Promise<Db> {
+  const mode = getStorageMode();
+  global.__aiTaxStorageMode = mode;
+  if (mode === 'postgres') {
+    const pg = await import('pg');
+    // NUMERIC and BIGINT come back as strings by default
+    pg.types.setTypeParser(1700, (v: string) => parseFloat(v));
+    pg.types.setTypeParser(20, (v: string) => parseInt(v, 10));
+    const pool = new pg.Pool({
+      connectionString: process.env.DATABASE_URL,
+      max: 5,
+      ssl: process.env.DATABASE_SSL === 'disable' ? undefined : { rejectUnauthorized: false },
+    });
+    return {
+      query: async <T,>(sql: string, params?: unknown[]) => {
+        const r = await pool.query(sql, params as unknown[] | undefined);
+        return { rows: r.rows as T[] };
+      },
+      exec: (sql: string) => pool.query(sql),
+    };
+  }
+  const { PGlite } = await import('@electric-sql/pglite');
+  let lite: InstanceType<typeof PGlite>;
+  if (mode === 'memory') {
+    lite = new PGlite();
+  } else {
+    const dataDir =
+      mode === 'embedded_ephemeral'
+        ? path.join('/tmp', 'ai-tax-pgdata')
+        : path.join(process.cwd(), '.data', 'pgdata');
+    fs.mkdirSync(dataDir, { recursive: true });
+    lite = new PGlite(dataDir);
+  }
+  return {
+    query: async <T,>(sql: string, params?: unknown[]) => {
+      const r = await lite.query<T>(sql, params as unknown[] | undefined);
+      return { rows: r.rows };
+    },
+    exec: (sql: string) => lite.exec(sql),
+  };
+}
 
+export async function getDb(): Promise<Db> {
+  if (global.__aiTaxDbInitPromise) return global.__aiTaxDbInitPromise;
+
+  global.__aiTaxDbInitPromise = (async () => {
+    const db = await openDb();
     await db.exec(DDL_SCHEMA);
 
-    // Seed tax_rule_versions
+    const seededIds = SEEDED_TAX_RULE_VERSIONS.map((v) => v.version_id);
     for (const ruleVersion of SEEDED_TAX_RULE_VERSIONS) {
       await db.query(
         `INSERT INTO tax_rule_versions (version_id, tax_year, effective_date, last_verified_at, status, official_sources, rules_payload)
@@ -330,78 +394,31 @@ export async function getDb(): Promise<PGlite> {
         ]
       );
     }
-
-    // Seed default demo user & admin user
-    const now = new Date().toISOString();
-    const demoUserId = 'user_alex_morgan';
-    const adminUserId = 'user_admin_staff';
-
+    // Older rule versions stay for history (calculation runs reference them) but are never used again.
     await db.query(
-      `INSERT INTO users (id, email, password_hash, full_name, role, status, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (id) DO NOTHING`,
-      [
-        demoUserId,
-        'alex.morgan@consulting.io',
-        hashPassword('TaxOpt2026!'),
-        'Alex Morgan (W-2 & 1099 Consultant)',
-        'user',
-        'active',
-        now,
-      ]
+      `UPDATE tax_rule_versions SET status = 'deprecated' WHERE NOT (version_id = ANY($1::text[]))`,
+      [seededIds]
     );
 
-    await db.query(
-      `INSERT INTO users (id, email, password_hash, full_name, role, status, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (id) DO NOTHING`,
-      [
-        adminUserId,
-        'admin@aitax.us',
-        hashPassword('AdminTax2026!'),
-        'Sarah Chen (Staff Tax & Compliance Admin)',
-        'admin',
-        'active',
-        now,
-      ]
-    );
+    // Admin accounts come only from the environment — never from source code.
+    const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+    const adminPassword = process.env.ADMIN_PASSWORD;
+    if (adminEmail && adminPassword && adminPassword.length >= 12) {
+      await db.query(
+        `INSERT INTO users (id, email, password_hash, full_name, role, status, created_at)
+         VALUES ($1, $2, $3, 'Administrator', 'admin', 'active', $4)
+         ON CONFLICT (email) DO UPDATE SET role = 'admin', password_hash = EXCLUDED.password_hash`,
+        [`user_admin_${computeSha256(adminEmail).slice(0, 12)}`, adminEmail, hashPassword(adminPassword), new Date().toISOString()]
+      );
+    }
 
-    await db.query(
-      `INSERT INTO user_profiles (
-        user_id, tax_year, filing_status, state_code, business_type, industry_code,
-        has_w2_income, has_1099_income, has_schedule_c, dependents_count, qualifying_children_under_17,
-        child_care_expenses_paid, education_expenses_paid, education_years_claimed, is_student_at_least_half_time,
-        home_total_sqft, home_office_sqft, home_office_exclusive_regular_use,
-        home_annual_rent_or_mortgage_interest, home_annual_utilities_insurance,
-        vehicle_total_miles, vehicle_business_miles, vehicle_actual_expenses, vehicle_placed_in_service_date,
-        self_employed_health_insurance_premiums, sep_ira_solo_401k_contributions, estimated_tax_payments_made,
-        has_unsupported_complex_entity, unsupported_entity_notes, updated_at
-      ) VALUES (
-        $1, 2025, 'single', 'CA', 'Sole Proprietorship / AI & Product Consultant', '541511 - Custom Computer Programming',
-        TRUE, TRUE, TRUE, 1, 1,
-        3200, 0, 0, FALSE,
-        1600, 220, TRUE,
-        32400, 4200,
-        12000, 4850, 3100, '2025-01-15',
-        5400, 8000, 6500,
-        FALSE, NULL, $2
-      ) ON CONFLICT (user_id) DO NOTHING`,
-      [demoUserId, now]
-    );
-
-    await db.query(
-      `INSERT INTO subscriptions (
-        id, user_id, plan, status, price_cents, stripe_subscription_id, stripe_webhook_verified, current_period_end, created_at
-      ) VALUES ($1, $2, 'pro_monthly', 'active', 1000, 'sub_verified_seed_01', TRUE, '2026-12-31T23:59:59Z', $3)
-      ON CONFLICT (id) DO NOTHING`,
-      ['sub_alex_01', demoUserId, now]
-    );
-
-    global.__aiTaxPgInstance = db;
     return db;
-  })();
+  })().catch((err) => {
+    global.__aiTaxDbInitPromise = undefined;
+    throw err;
+  });
 
-  return global.__aiTaxPgInitPromise;
+  return global.__aiTaxDbInitPromise;
 }
 
 export async function writeAuditLog(params: {

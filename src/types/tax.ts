@@ -122,6 +122,10 @@ export interface UserProfileRecord {
   self_employed_health_insurance_premiums: number;
   sep_ira_solo_401k_contributions: number;
   estimated_tax_payments_made: number;
+  /** Set only when the user confirms a contemporaneous mileage log (IRC §274(d)). */
+  vehicle_mileage_log_confirmed: boolean;
+  /** Business miles driven on/after a mid-year IRS rate change (e.g. 1 Jul 2026). */
+  vehicle_business_miles_after_rate_change: number;
   has_unsupported_complex_entity: boolean;
   unsupported_entity_notes: string | null;
   updated_at: string;
@@ -260,6 +264,19 @@ export interface TaxRuleVersionRecord {
   rules_payload: TaxYearRulesPayload;
 }
 
+export interface EitcColumn {
+  /** Statutory credit (phase-in) rate, IRC §32(b)(1) */
+  credit_rate: number;
+  /** Statutory phase-out rate, IRC §32(b)(1) */
+  phaseout_rate: number;
+  earned_income_amount: number;
+  max_credit: number;
+  threshold_phaseout_mfj: number;
+  completed_phaseout_mfj: number;
+  threshold_phaseout_other: number;
+  completed_phaseout_other: number;
+}
+
 export interface TaxYearRulesPayload {
   tax_year: TaxYear;
   standard_deduction: Record<FilingStatus, number>;
@@ -271,33 +288,55 @@ export interface TaxYearRulesPayload {
   se_net_earnings_factor: number;
   se_deductible_half_factor: number;
   qbi_deduction_rate: number;
-  qbi_phaseout_start: Record<FilingStatus, number>;
-  qbi_phaseout_range: Record<FilingStatus, number>;
+  /** §199A(e)(2) threshold amount */
+  qbi_threshold: Record<FilingStatus, number>;
+  /** Width of the §199A(d)(3) phase-in range (75k/150k from 2026 under OBBBA) */
+  qbi_phase_in_range: Record<FilingStatus, number>;
+  /** §199A(i) minimum deduction (OBBBA, from 2026); 0 when not in force */
+  qbi_minimum_deduction: number;
+  qbi_minimum_deduction_qbi_floor: number;
+  /** Business standard mileage rate (cents) in force from Jan 1 */
   standard_mileage_rate_cents: number;
+  /** Mid-year change, if the IRS changed the rate during the year */
+  standard_mileage_rate_change: { effective_date: string; cents: number } | null;
   home_office_simplified_rate_per_sqft: number;
   home_office_simplified_max_sqft: number;
   meals_deduction_factor: number;
   section_179_max_deduction: number;
   section_179_phaseout_threshold: number;
-  bonus_depreciation_rate: number;
+  sep_ira_dollar_limit: number;
+  sep_ira_rate: number;
   child_tax_credit_per_child: number;
   child_tax_credit_refundable_cap: number;
   child_tax_credit_phaseout_start: Record<FilingStatus, number>;
+  child_tax_credit_phaseout_per_1000: number;
+  other_dependent_credit: number;
+  actc_earned_income_threshold: number;
+  actc_rate: number;
   child_care_max_one_dependent: number;
   child_care_max_two_plus_dependents: number;
-  child_care_credit_rate: number;
+  /** §21(a)(2) applicable percentage schedule */
+  child_care_rate_schedule: {
+    max_rate: number;
+    first_reduction_agi: number;
+    first_floor_rate: number;
+    second_reduction_agi: Record<FilingStatus, number> | null;
+    second_reduction_step: Record<FilingStatus, number> | null;
+    final_floor_rate: number;
+  };
   aotc_max_credit: number;
-  aotc_phaseout_start: Record<FilingStatus, number>;
+  aotc_refundable_share: number;
   llc_max_credit: number;
-  eitc_max_agi_no_children: Record<FilingStatus, number>;
-  eitc_max_credit_no_children: number;
-  eitc_max_agi_with_children: Record<FilingStatus, number>;
-  eitc_max_credit_with_children: number;
+  education_phaseout: Record<FilingStatus, { start: number; end: number }>;
+  /** Indexed by number of qualifying children: 0, 1, 2, 3+ */
+  eitc: [EitcColumn, EitcColumn, EitcColumn, EitcColumn];
+  eitc_investment_income_limit: number;
   federal_brackets: Record<
     FilingStatus,
     Array<{ up_to: number | null; rate: number }>
   >;
-  state_flat_effective_rates: Record<string, number>;
+  /** States with no tax on wage/self-employment income: state tax is $0 there. Every other state is reported as "not calculated". */
+  states_without_wage_income_tax: string[];
 }
 
 export interface ScenarioTaxBreakdown {
@@ -341,6 +380,13 @@ export interface ScenarioTaxBreakdown {
   effective_tax_rate_pct: number;
   marginal_combined_rate_pct: number;
   savings_vs_baseline: number;
+  /** "no_wage_income_tax": the state has no wage/SE income tax ($0). "not_calculated": state tax is NOT included in any total. */
+  state_tax_status: 'no_wage_income_tax' | 'not_calculated';
+  other_dependent_credit: number;
+  nonrefundable_credits_used: number;
+  refundable_credits: number;
+  vehicle_method: 'standard_mileage' | 'actual_expenses' | 'none';
+  home_office_method: 'simplified' | 'regular' | 'ineligible';
 }
 
 export interface TaxRecommendationRecord {

@@ -1,9 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb, writeAuditLog } from '@/lib/db';
 import { recomputeTaxWorkspaceForUser } from '@/lib/services/workspace-service';
+import { errorResponse, requireAdmin } from '@/lib/security/vault-and-auth';
+import { refundExportPurchase } from '@/lib/services/stripe-billing';
+import { SEEDED_TAX_RULE_VERSIONS } from '@/lib/tax-rules/seed-rules';
+import { TaxYear } from '@/types/tax';
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    const admin = await requireAdmin(req);
+    return await adminSnapshot(admin.id);
+  } catch (err) {
+    return errorResponse(err, 500);
+  }
+}
+
+async function adminSnapshot(adminId: string) {
+  {
     const db = await getDb();
 
     const usersRes = await db.query(
@@ -62,22 +75,19 @@ export async function GET() {
             ?.qa_summary || null,
       },
     });
-  } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Admin query failed' },
-      { status: 500 }
-    );
   }
 }
 
 export async function POST(req: NextRequest) {
   try {
+    const admin = await requireAdmin(req);
     const body = await req.json();
-    const { action, targetId, userId = 'user_alex_morgan', taxYear = 2025 } = body;
+    const { action, targetId } = body as { action: string; targetId: string };
     const db = await getDb();
     const now = new Date().toISOString();
 
     if (action === 'toggle_user_status') {
+      if (targetId === admin.id) throw new Error('You cannot block your own account');
       const uRes = await db.query<{ status: string }>(
         `SELECT status FROM users WHERE id = $1`,
         [targetId]
@@ -85,40 +95,52 @@ export async function POST(req: NextRequest) {
       const nextStatus = uRes.rows[0]?.status === 'blocked' ? 'active' : 'blocked';
       await db.query(`UPDATE users SET status = $2 WHERE id = $1`, [targetId, nextStatus]);
       await writeAuditLog({
-        userId: 'user_admin_staff',
+        userId: admin.id,
         actorRole: 'admin',
         action: `ADMIN_USER_STATUS_${nextStatus.toUpperCase()}`,
         entityType: 'user',
         entityId: targetId,
       });
     } else if (action === 'reprocess_document') {
-      await recomputeTaxWorkspaceForUser(userId, taxYear);
+      const docRes = await db.query<{ user_id: string; tax_year: number }>(
+        `SELECT user_id, tax_year FROM documents WHERE id = $1`,
+        [targetId]
+      );
+      const doc = docRes.rows[0];
+      if (!doc) throw new Error('Document not found');
+      await recomputeTaxWorkspaceForUser(doc.user_id, (doc.tax_year === 2026 ? 2026 : 2025) as TaxYear);
       await writeAuditLog({
-        userId: 'user_admin_staff',
+        userId: admin.id,
         actorRole: 'admin',
         action: 'ADMIN_REPROCESSED_DOCUMENT_PIPELINE',
         entityType: 'document',
         entityId: targetId,
       });
     } else if (action === 'verify_tax_rule_version') {
+      if (!SEEDED_TAX_RULE_VERSIONS.some((v) => v.version_id === targetId)) {
+        throw new Error('Only the current rule versions shipped with the engine can be re-verified');
+      }
       await db.query(
         `UPDATE tax_rule_versions SET last_verified_at = $2, status = 'active' WHERE version_id = $1`,
         [targetId, now]
       );
       await writeAuditLog({
-        userId: 'user_admin_staff',
+        userId: admin.id,
         actorRole: 'admin',
         action: 'ADMIN_APPROVED_TAX_RULE_VERSION',
         entityType: 'tax_rule_version',
         entityId: targetId,
       });
     } else if (action === 'refund_export_purchase') {
-      await db.query(
-        `UPDATE export_purchases SET status = 'refunded' WHERE id = $1`,
+      // Real refund in Stripe; the status flips to "refunded" when Stripe's charge.refunded webhook arrives.
+      const p = await db.query<{ stripe_payment_intent_id: string; status: string }>(
+        `SELECT stripe_payment_intent_id, status FROM export_purchases WHERE id = $1`,
         [targetId]
       );
+      if (!p.rows[0] || p.rows[0].status !== 'paid') throw new Error('Purchase not found or not paid');
+      await refundExportPurchase(p.rows[0].stripe_payment_intent_id);
       await writeAuditLog({
-        userId: 'user_admin_staff',
+        userId: admin.id,
         actorRole: 'admin',
         action: 'ADMIN_REFUNDED_EXPORT_PURCHASE',
         entityType: 'export_purchase',
@@ -126,12 +148,8 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const refreshed = await GET();
-    return refreshed;
+    return await adminSnapshot(admin.id);
   } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Admin action failed' },
-      { status: 400 }
-    );
+    return errorResponse(err);
   }
 }

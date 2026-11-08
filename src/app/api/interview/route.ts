@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getAuthenticatedUser } from '@/lib/security/vault-and-auth';
+import { errorResponse, getAuthenticatedUser } from '@/lib/security/vault-and-auth';
 import { getDb, writeAuditLog } from '@/lib/db';
 import {
   getFullWorkspaceState,
@@ -121,10 +121,11 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!isSkip && question.category === 'vehicle_mileage' && selectedOption === 'personal_use') {
+    if (!isSkip && question.category === 'vehicle_mileage') {
+      // Only a confirmed contemporaneous log (IRC §274(d)) moves mileage into the confirmed scenario.
       await db.query(
-        `UPDATE user_profiles SET vehicle_business_miles = 0, updated_at = $2 WHERE user_id = $1`,
-        [user.id, now]
+        `UPDATE user_profiles SET vehicle_mileage_log_confirmed = $2, updated_at = $3 WHERE user_id = $1`,
+        [user.id, selectedOption === '100_business', now]
       );
     }
 
@@ -143,9 +144,6 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ ok: true, data: updatedState });
   } catch (err) {
-    return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'Failed to record interview answer' },
-      { status: 400 }
-    );
+    return errorResponse(err, 400);
   }
 }

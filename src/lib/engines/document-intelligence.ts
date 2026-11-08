@@ -105,8 +105,11 @@ export async function extractTransactionsFromContent(params: {
   extractedRows: RawExtractedTransaction[];
   missingPagesDetected: boolean;
   extractedMetadata: Record<string, unknown>;
+  /** Set when the file could not be read; nothing from it may be used. */
+  extractionError: string | null;
 }> {
   const { filename, format, buffer, taxYear } = params;
+  let extractionError: string | null = null;
   let rawText = '';
   let ocrUsed = false;
   let missingPagesDetected = false;
@@ -201,10 +204,29 @@ export async function extractTransactionsFromContent(params: {
       });
     });
   } else {
-    // PDF, JPG, PNG (Text or OCR extraction)
-    rawText = buffer.toString('utf8');
-    if (format === 'JPG' || format === 'PNG' || rawText.includes('OCR_SCAN')) {
+    // PDF, JPG, PNG: real text extraction. A file that cannot be read yields no rows — never guessed ones.
+    const isRealPdf = buffer.subarray(0, 5).toString('latin1') === '%PDF-';
+    if (format === 'PDF' && isRealPdf) {
+      try {
+        rawText = await extractPdfText(buffer);
+      } catch {
+        extractionError = 'The PDF could not be opened (damaged or password-protected). Nothing from it is used.';
+      }
+      if (!extractionError && rawText.replace(/\s/g, '').length < 20) {
+        extractionError =
+          'This PDF has no text layer (it looks like a scan). Scanned PDFs are not read in this version — upload the bank\'s CSV/XLSX export or a photo (JPG/PNG) of each page instead.';
+        rawText = '';
+      }
+    } else if (format === 'JPG' || format === 'PNG') {
       ocrUsed = true;
+      try {
+        rawText = await runOcr(buffer);
+      } catch (e) {
+        extractionError = `OCR could not read this image (${e instanceof Error ? e.message : 'unknown error'}). Nothing from it is used.`;
+      }
+    } else {
+      // Plain-text content with a document extension (e.g. exported statements, test fixtures)
+      rawText = buffer.toString('utf8');
     }
 
     // Check for missing page markers (e.g., "Page 1 of 3" without "Page 2 of 3")
@@ -219,7 +241,42 @@ export async function extractTransactionsFromContent(params: {
 
     // Check structured tax forms (W-2, 1099-NEC, 1099-K, 1098, 1095-A) or line-by-line statement entries
     const lines = rawText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    let sectionDirection: 'inflow' | 'outflow' | null = null;
     lines.forEach((line, idx) => {
+      if (/^(deposits|deposits and (other )?(additions|credits)|credits|payments and credits)\b/i.test(line)) {
+        sectionDirection = 'inflow';
+      } else if (/^(withdrawals|electronic withdrawals|other withdrawals|checks paid|purchases|fees|atm & debit card withdrawals|debits)\b/i.test(line)) {
+        sectionDirection = 'outflow';
+      }
+      // Bank-statement style: "01/15[/2025] DESCRIPTION -123.45 [balance]"
+      const stmt = line.match(
+        /^(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\s+(.+?)\s+(-?\$?\(?[\d,]+\.\d{2}\)?)(?:\s+-?\$?[\d,]+\.\d{2})?$/
+      );
+      if (stmt && !line.includes('|')) {
+        const parts = stmt[1].split('/');
+        const year = parts[2] ? (parts[2].length === 2 ? `20${parts[2]}` : parts[2]) : String(taxYear);
+        const { date, valid: dateValid } = normalizeDateString(`${parts[0]}/${parts[1]}/${year}`);
+        const amtRaw = stmt[3];
+        const negative = amtRaw.startsWith('-') || amtRaw.includes('(');
+        const amount = Number(amtRaw.replace(/[-$,()]/g, ''));
+        const desc = stmt[2].trim();
+        const direction: 'inflow' | 'outflow' = negative ? 'outflow' : sectionDirection ?? 'outflow';
+        // Direction is only certain with a sign or a section header; otherwise the user confirms it.
+        const certainDirection = negative || sectionDirection !== null;
+        extractedRows.push({
+          transaction_date: date,
+          amount: isNaN(amount) ? 0 : amount,
+          currency: 'USD',
+          direction,
+          merchant_name: normalizeMerchantName(desc),
+          raw_description: desc,
+          source_page: 1,
+          source_line_ref: `${format}:Line-${idx + 1}`,
+          extraction_confidence:
+            dateValid && !isNaN(amount) ? (certainDirection ? (ocrUsed ? 0.8 : 0.9) : 0.6) : 0.4,
+        });
+        return;
+      }
       // Match structured line format: YYYY-MM-DD | Description | $Amount | [inflow/outflow]
       const txMatch = line.match(
         /^(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4}|\?\?\?\?-\?\?-\?\?)\s*[|,\t-]\s*(.+?)\s*[|,\t]\s*([+-]?\$?\d[\d,]*\.?\d*|\?\?\?)(?:\s*[|,\t]\s*(inflow|outflow))?$/i
@@ -302,7 +359,34 @@ export async function extractTransactionsFromContent(params: {
     extractedRows,
     missingPagesDetected,
     extractedMetadata,
+    extractionError,
   };
+}
+
+async function extractPdfText(buffer: Buffer): Promise<string> {
+  // Import the library entry directly: the package index runs a debug self-test on import.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mod: any = await import('pdf-parse/lib/pdf-parse.js');
+  const pdfParse = mod.default || mod;
+  const result = await pdfParse(buffer);
+  return String(result.text || '');
+}
+
+const OCR_TIMEOUT_MS = 45000;
+
+async function runOcr(buffer: Buffer): Promise<string> {
+  const { createWorker } = await import('tesseract.js');
+  const worker = await createWorker('eng');
+  try {
+    const job = worker.recognize(buffer);
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('timed out')), OCR_TIMEOUT_MS)
+    );
+    const { data } = await Promise.race([job, timeout]);
+    return data.text || '';
+  } finally {
+    await worker.terminate().catch(() => undefined);
+  }
 }
 
 /**
